@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simple CompTool API Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input, textarea {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        #results {
+            margin-top: 20px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 4px;
+            border-left: 4px solid #007bff;
+        }
+        .error {
+            border-left-color: #dc3545;
+            background: #f8d7da;
+        }
+        pre {
+            white-space: pre-wrap;
+            font-family: monospace;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Simple CompTool API Test</h1>
+        <p>Teste den Crawling- und LLM-Workflow</p>
+
+        <form id="scanForm">
+            <div class="form-group">
+                <label for="url">Website URL:</label>
+                <input type="url" id="url" required placeholder="https://example.com" value="https://example.com">
+            </div>
+
+            <div class="form-group">
+                <label for="name">Competitor Name (optional):</label>
+                <input type="text" id="name" placeholder="Example Company">
+            </div>
+
+            <div class="form-group">
+                <label>
+                    <input type="checkbox" id="llm"> LLM-Profil erstellen (benötigt OPENAI_API_KEY)
+                </label>
+            </div>
+
+            <button type="submit">Scan starten</button>
+        </form>
+
+        <div id="results" style="display: none;"></div>
+    </div>
+
+    <script>
+        document.getElementById('scanForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const resultsDiv = document.getElementById('results');
+            resultsDiv.style.display = 'block';
+            resultsDiv.className = '';
+            resultsDiv.innerHTML = '<p>Scanne Website... bitte warten...</p>';
+
+            const formData = {
+                url: document.getElementById('url').value,
+                name: document.getElementById('name').value || null,
+                llm: document.getElementById('llm').checked
+            };
+
+            try {
+                const response = await fetch('http://localhost:8000/api/scan', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(formData)
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.detail || `HTTP ${response.status}`);
+                }
+
+                resultsDiv.className = 'success';
+                resultsDiv.innerHTML = `
+                    <h3>✅ Scan erfolgreich!</h3>
+                    <p><strong>Competitor ID:</strong> ${data.competitor_id}</p>
+                    <p><strong>Snapshot ID:</strong> ${data.snapshot_id}</p>
+                    <p><strong>Seiten gefunden:</strong> ${data.pages.length}</p>
+
+                    ${data.profile ? `<p><strong>LLM-Profil:</strong></p><blockquote>${data.profile}</blockquote>` : ''}
+
+                    ${data.error ? `<p class="error"><strong>Fehler:</strong> ${data.error}</p>` : ''}
+
+                    <h4>Gefundene Seiten:</h4>
+                    <ul>
+                        ${data.pages.map(page => `
+                            <li>
+                                <strong>${page.title || 'Unbekannter Titel'}</strong><br>
+                                <small>URL: ${page.url}</small><br>
+                                <small>Status: ${page.status} | Hash: ${page.sha256_text.substring(0, 8)}...</small>
+                                ${page.meta_description ? `<br><small>${page.meta_description}</small>` : ''}
+                            </li>
+                        `).join('')}
+                    </ul>
+
+                    <details>
+                        <summary>Rohe API-Antwort</summary>
+                        <pre>${JSON.stringify(data, null, 2)}</pre>
+                    </details>
+                `;
+
+            } catch (error) {
+                resultsDiv.className = 'error';
+                resultsDiv.innerHTML = `
+                    <h3>❌ Fehler beim Scannen</h3>
+                    <p><strong>Fehler:</strong> ${error.message}</p>
+                    <p>Stelle sicher, dass:</p>
+                    <ul>
+                        <li>Das Backend läuft (python main.py)</li>
+                        <li>Die URL gültig ist</li>
+                        <li>Für LLM: OPENAI_API_KEY ist gesetzt</li>
+                    </ul>
+                `;
+            }
+        });
+    </script>
+</body>
+</html>

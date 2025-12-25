@@ -15,7 +15,14 @@ CREATE TABLE IF NOT EXISTS snapshots (
     competitor_id UUID NOT NULL REFERENCES competitors(id) ON DELETE CASCADE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     page_count INTEGER DEFAULT 0,
-    notes TEXT
+    notes TEXT,
+    status TEXT DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'partial', 'done', 'failed')),
+    progress_pages_done INTEGER DEFAULT 0,
+    progress_pages_total INTEGER DEFAULT 0,
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ NULL,
+    error_code TEXT NULL,
+    error_message TEXT NULL
 );
 
 -- Pages Tabelle

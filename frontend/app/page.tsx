@@ -29,6 +29,8 @@ interface ScanResult {
   pages?: PageInfo[];
   profile?: string;
   error?: ErrorDetail;
+  snapshot_status?: string;
+  progress?: { done: number; total: number };
 }
 
 interface SnapshotDetails {
@@ -38,6 +40,13 @@ interface SnapshotDetails {
   page_count: number;
   notes?: string;
   pages?: PageInfo[];
+  status?: string;
+  progress_pages_done?: number;
+  progress_pages_total?: number;
+  started_at?: string;
+  finished_at?: string;
+  error_code?: string;
+  error_message?: string;
 }
 
 interface Competitor {
@@ -51,6 +60,9 @@ interface Competitor {
     page_count: number;
     base_url?: string;
     notes?: string;
+    status?: string;
+    progress_pages_done?: number;
+    progress_pages_total?: number;
   }>;
 }
 
@@ -61,11 +73,57 @@ export default function Home() {
   const [snapshotDetails, setSnapshotDetails] = useState<SnapshotDetails | null>(null);
   const [error, setError] = useState('');
   const [competitors, setCompetitors] = useState<Competitor[]>([]);
+  const [isPolling, setIsPolling] = useState(false);
+  const [currentProgress, setCurrentProgress] = useState<{ done: number; total: number } | null>(null);
 
   // Lade alle Competitors beim ersten Laden
   useEffect(() => {
     loadCompetitors();
   }, []);
+
+  // Status Polling für laufende Scans
+  useEffect(() => {
+    let intervalId: NodeJS.Timeout | null = null;
+
+    if (isPolling && scanResult?.snapshot_id) {
+      intervalId = setInterval(async () => {
+        try {
+          const response = await fetch(`${API_BASE_URL}/api/snapshots/${scanResult.snapshot_id}/status`);
+          if (response.ok) {
+            const statusData = await response.json();
+
+            // Update Progress
+            setCurrentProgress(statusData.progress);
+
+            // Update ScanResult Progress
+            setScanResult(prev => prev ? {
+              ...prev,
+              snapshot_status: statusData.status,
+              progress: statusData.progress
+            } : null);
+
+            // Stoppe Polling wenn fertig oder fehlgeschlagen
+            if (statusData.status === 'done' || statusData.status === 'failed') {
+              setIsPolling(false);
+              if (statusData.status === 'done') {
+                // Lade finale Snapshot-Daten
+                await loadSnapshotDetails(scanResult.snapshot_id);
+              }
+            }
+          }
+        } catch (err) {
+          console.error('Fehler beim Status-Polling:', err);
+          setIsPolling(false);
+        }
+      }, 2500); // Alle 2.5 Sekunden
+    }
+
+    return () => {
+      if (intervalId) {
+        clearInterval(intervalId);
+      }
+    };
+  }, [isPolling, scanResult?.snapshot_id]);
 
   const loadCompetitors = async () => {
     try {
@@ -79,18 +137,7 @@ export default function Home() {
     }
   };
 
-  const normalizeUrl = (input: string): string => {
-    const trimmed = input.trim();
-    if (!trimmed) return trimmed;
-    
-    // Wenn bereits ein Protokoll vorhanden ist, zurückgeben
-    if (trimmed.match(/^https?:\/\//i)) {
-      return trimmed;
-    }
-    
-    // Ansonsten "https://" voranstellen
-    return `https://${trimmed}`;
-  };
+  // URL-Normalisierung wurde ins Backend verschoben
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -98,8 +145,10 @@ export default function Home() {
     setError('');
     setScanResult(null);
     setSnapshotDetails(null);
+    setIsPolling(false);
+    setCurrentProgress(null);
 
-    const normalizedUrl = normalizeUrl(url);
+    // URL wird jetzt im Backend normalisiert
 
     try {
       const response = await fetch(`${API_BASE_URL}/api/scan`, {
@@ -109,7 +158,7 @@ export default function Home() {
         },
         body: JSON.stringify({
           name: null,
-          url: normalizedUrl,
+          url: url.trim(), // URL wird im Backend normalisiert
           llm: false, // Für jetzt ohne LLM
         }),
       });
@@ -128,10 +177,16 @@ export default function Home() {
       }
 
       setScanResult(result);
+      setCurrentProgress(result.progress || null);
 
       // Snapshot-Details laden, wenn verfügbar
       if (result.snapshot_id) {
         await loadSnapshotDetails(result.snapshot_id);
+
+        // Starte Polling für laufende Scans
+        if (result.snapshot_status === 'partial' || result.snapshot_status === 'running') {
+          setIsPolling(true);
+        }
       }
 
       // Competitors neu laden
@@ -209,6 +264,41 @@ export default function Home() {
             <div className="result-value">{scanResult.pages?.length ?? 0}</div>
           </div>
 
+          {scanResult.snapshot_status && (
+            <div className="result-item">
+              <div className="result-label">Status:</div>
+              <div className="result-value">
+                <span className={`status-badge ${scanResult.snapshot_status.toLowerCase()}`}>
+                  {scanResult.snapshot_status}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {scanResult.progress && (
+            <div className="result-item">
+              <div className="result-label">Fortschritt:</div>
+              <div className="result-value">
+                <div className="progress-info">
+                  {scanResult.progress.total > 0
+                    ? `${scanResult.progress.done} / ${scanResult.progress.total} Seiten`
+                    : '0 / 0 Seiten'
+                  }
+                  <div className="progress-bar">
+                    <div
+                      className="progress-fill"
+                      style={{
+                        width: `${scanResult.progress.total > 0
+                          ? (scanResult.progress.done / scanResult.progress.total) * 100
+                          : 0}%`
+                      }}
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
           {scanResult.profile && (
             <div className="result-item">
               <div className="result-label">LLM-Profil:</div>
@@ -231,19 +321,57 @@ export default function Home() {
         <div className="snapshot-details">
           <h2>Snapshot-Details</h2>
 
+          <div className="snapshot-status">
+            <div className="status-info">
+              <div className="status-item">
+                <div className="status-label">Status</div>
+                <div className={`status-value ${snapshotDetails.status?.toLowerCase() || 'unknown'}`}>
+                  {snapshotDetails.status || 'Unknown'}
+                </div>
+              </div>
+              <div className="status-item">
+                <div className="status-label">Seiten</div>
+                <div className="status-value">
+                  {snapshotDetails.page_count}
+                  {(snapshotDetails.progress_pages_done !== undefined && snapshotDetails.progress_pages_total !== undefined) &&
+                    ` (${snapshotDetails.progress_pages_total > 0
+                      ? `${snapshotDetails.progress_pages_done}/${snapshotDetails.progress_pages_total}`
+                      : '0/0'
+                    })`
+                  }
+                </div>
+              </div>
+              <div className="status-item">
+                <div className="status-label">Erstellt</div>
+                <div className="status-value">{formatDate(snapshotDetails.created_at)}</div>
+              </div>
+              {snapshotDetails.started_at && (
+                <div className="status-item">
+                  <div className="status-label">Gestartet</div>
+                  <div className="status-value">{formatDate(snapshotDetails.started_at)}</div>
+                </div>
+              )}
+              {snapshotDetails.finished_at && (
+                <div className="status-item">
+                  <div className="status-label">Fertig</div>
+                  <div className="status-value">{formatDate(snapshotDetails.finished_at)}</div>
+                </div>
+              )}
+            </div>
+          </div>
+
           <div className="snapshot-info">
             <div className="info-item">
               <strong>Snapshot ID:</strong> {snapshotDetails.id}
             </div>
-            <div className="info-item">
-              <strong>Erstellt:</strong> {formatDate(snapshotDetails.created_at)}
-            </div>
-            <div className="info-item">
-              <strong>Seiten:</strong> {snapshotDetails.page_count}
-            </div>
             {snapshotDetails.notes && (
               <div className="info-item">
                 <strong>Notizen:</strong> {snapshotDetails.notes}
+              </div>
+            )}
+            {snapshotDetails.error_message && (
+              <div className="info-item error">
+                <strong>Fehler:</strong> {snapshotDetails.error_message}
               </div>
             )}
           </div>
@@ -341,16 +469,31 @@ export default function Home() {
                 <strong>Snapshots:</strong>
                 {competitor.snapshots && competitor.snapshots.length > 0 ? (
                   competitor.snapshots.map((snapshot) => (
-                    <div 
-                      key={snapshot.id} 
+                    <div
+                      key={snapshot.id}
                       className="snapshot-item"
                       onClick={() => loadSnapshotDetails(snapshot.id)}
                       style={{ cursor: 'pointer', padding: '5px', borderRadius: '4px', transition: 'background-color 0.2s' }}
                       onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#f0f0f0'}
                       onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
                     >
-                      {formatDate(snapshot.created_at)} - {snapshot.page_count} Seiten
-                      {snapshot.base_url && ` (${snapshot.base_url})`}
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <span>{formatDate(snapshot.created_at)} - {snapshot.page_count} Seiten</span>
+                        {snapshot.status && (
+                          <span className={`status-badge ${snapshot.status.toLowerCase()}`}>
+                            {snapshot.status}
+                          </span>
+                        )}
+                      </div>
+                      {snapshot.base_url && <div style={{ fontSize: '12px', color: '#666', marginTop: '2px' }}>{snapshot.base_url}</div>}
+                      {(snapshot.progress_pages_done !== undefined && snapshot.progress_pages_total !== undefined) && (
+                        <div style={{ fontSize: '12px', color: '#666', marginTop: '2px' }}>
+                          Progress: {snapshot.progress_pages_total > 0
+                            ? `${snapshot.progress_pages_done}/${snapshot.progress_pages_total}`
+                            : '0/0'
+                          }
+                        </div>
+                      )}
                     </div>
                   ))
                 ) : (

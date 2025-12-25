@@ -325,3 +325,114 @@ button:disabled {
   color: white;
 }
 
+/* Status Badge */
+.status-badge {
+  display: inline-block;
+  padding: 4px 8px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 500;
+  text-transform: uppercase;
+}
+
+.status-badge.partial {
+  background: #ffc107;
+  color: #212529;
+}
+
+.status-badge.running {
+  background: #17a2b8;
+  color: white;
+}
+
+.status-badge.done {
+  background: #28a745;
+  color: white;
+}
+
+.status-badge.failed {
+  background: #dc3545;
+  color: white;
+}
+
+.status-badge.queued {
+  background: #6c757d;
+  color: white;
+}
+
+/* Progress Bar */
+.progress-info {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.progress-bar {
+  width: 200px;
+  height: 8px;
+  background: #e9ecef;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #28a745, #20c997);
+  transition: width 0.3s ease;
+}
+
+.progress-text {
+  font-size: 14px;
+  color: #6c757d;
+}
+
+/* Snapshot Status in Details */
+.snapshot-status {
+  margin-bottom: 20px;
+  padding: 15px;
+  background: #f8f9fa;
+  border-radius: 6px;
+  border-left: 4px solid #007bff;
+}
+
+.status-info {
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+.status-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.status-label {
+  font-size: 12px;
+  color: #6c757d;
+  text-transform: uppercase;
+  font-weight: 500;
+}
+
+.status-value {
+  font-size: 14px;
+  font-weight: 600;
+  color: #495057;
+}
+
+.status-value.done {
+  color: #28a745;
+}
+
+.status-value.failed {
+  color: #dc3545;
+}
+
+.status-value.partial {
+  color: #ffc107;
+}
+
+.status-value.running {
+  color: #17a2b8;
+}
+

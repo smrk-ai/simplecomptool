@@ -41,7 +41,14 @@ CREATE TABLE IF NOT EXISTS snapshots (
     competitor_id UUID NOT NULL REFERENCES competitors(id) ON DELETE CASCADE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     page_count INTEGER DEFAULT 0,
-    notes TEXT
+    notes TEXT,
+    status TEXT DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'partial', 'done', 'failed')),
+    progress_pages_done INTEGER DEFAULT 0,
+    progress_pages_total INTEGER DEFAULT 0,
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ NULL,
+    error_code TEXT NULL,
+    error_message TEXT NULL
 );
 
 -- Pages Tabelle
@@ -82,6 +89,48 @@ CREATE TABLE IF NOT EXISTS profiles (
     text TEXT NOT NULL,
     UNIQUE(competitor_id, snapshot_id)
 );
+
+-- Migration für bestehende Snapshots (füge neue Felder hinzu)
+DO $$
+BEGIN
+    -- Füge neue Spalten hinzu, falls sie noch nicht existieren
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'snapshots' AND column_name = 'status') THEN
+        ALTER TABLE snapshots ADD COLUMN status TEXT DEFAULT 'done' CHECK (status IN ('queued', 'running', 'partial', 'done', 'failed'));
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'snapshots' AND column_name = 'progress_pages_done') THEN
+        ALTER TABLE snapshots ADD COLUMN progress_pages_done INTEGER DEFAULT 0;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'snapshots' AND column_name = 'progress_pages_total') THEN
+        ALTER TABLE snapshots ADD COLUMN progress_pages_total INTEGER DEFAULT 0;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'snapshots' AND column_name = 'started_at') THEN
+        ALTER TABLE snapshots ADD COLUMN started_at TIMESTAMPTZ;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'snapshots' AND column_name = 'finished_at') THEN
+        ALTER TABLE snapshots ADD COLUMN finished_at TIMESTAMPTZ NULL;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'snapshots' AND column_name = 'error_code') THEN
+        ALTER TABLE snapshots ADD COLUMN error_code TEXT NULL;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'snapshots' AND column_name = 'error_message') THEN
+        ALTER TABLE snapshots ADD COLUMN error_message TEXT NULL;
+    END IF;
+
+    -- Aktualisiere bestehende Snapshots auf 'done' und setze progress
+    UPDATE snapshots SET
+        status = 'done',
+        progress_pages_done = page_count,
+        progress_pages_total = page_count,
+        started_at = created_at,
+        finished_at = created_at
+    WHERE status IS NULL OR status = 'queued';
+END $$;
 
 -- Indizes für Performance
 CREATE INDEX IF NOT EXISTS idx_snapshots_competitor_id ON snapshots(competitor_id);

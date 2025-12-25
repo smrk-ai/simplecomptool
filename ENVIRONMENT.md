@@ -42,3 +42,21 @@ NEXT_PUBLIC_API_URL=http://localhost:8000
 ## Standardwerte
 
 Alle konfigurierbaren Variablen haben sinnvolle Standardwerte für die lokale Entwicklung.
+
+## Bekannte Probleme
+
+### EPERM-Fehler beim Frontend-Start
+
+**Symptom:**
+```
+Error: EPERM: operation not permitted, open '.../node_modules/next/dist/...'
+```
+
+**Ursache:**
+Sandbox-Berechtigungsproblem mit `node_modules`. Dies ist kein Code-Problem, sondern ein System-Berechtigungsproblem.
+
+**Lösung:**
+1. Frontend außerhalb des Sandbox-Modus starten
+2. `node_modules` Berechtigungen prüfen: `ls -la frontend/node_modules`
+3. Falls nötig: `chmod -R u+r frontend/node_modules`
+4. Oder: `node_modules` neu installieren: `cd frontend && rm -rf node_modules && npm install`

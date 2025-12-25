@@ -133,6 +133,26 @@ def get_competitors() -> List[dict]:
         result = supabase.table('competitors').select(
             'id, name, base_url, created_at'
         ).order('created_at', desc=True).execute()
+        
+        # Snapshots für jeden Competitor laden
+        for competitor in result.data:
+            competitor_id = competitor['id']
+            competitor_base_url = competitor.get('base_url', '')
+            
+            # base_url als url für Frontend-Kompatibilität
+            competitor['url'] = competitor_base_url
+            
+            # Snapshots laden
+            snapshots_result = supabase.table('snapshots').select(
+                'id, created_at, page_count, notes'
+            ).eq('competitor_id', competitor_id).order('created_at', desc=True).execute()
+            
+            # base_url zu jedem Snapshot hinzufügen
+            for snapshot in snapshots_result.data:
+                snapshot['base_url'] = competitor_base_url
+            
+            competitor["snapshots"] = snapshots_result.data
+        
         return result.data
     except Exception as e:
         logger.error(f"Fehler beim Laden der Competitors: {e}")
@@ -152,11 +172,19 @@ def get_competitor(competitor_id: str) -> Optional[dict]:
         competitor = competitor_result.data[0]
         competitor["snapshots"] = []
         competitor["socials"] = get_competitor_socials(competitor_id)
+        
+        # base_url als url für Frontend-Kompatibilität
+        competitor['url'] = competitor.get('base_url', '')
 
         # Snapshots für diesen Competitor laden
         snapshots_result = supabase.table('snapshots').select(
             'id, created_at, page_count, notes'
         ).eq('competitor_id', competitor_id).order('created_at', desc=True).execute()
+
+        # base_url von Competitor zu jedem Snapshot hinzufügen
+        competitor_base_url = competitor.get('base_url', '')
+        for snapshot in snapshots_result.data:
+            snapshot['base_url'] = competitor_base_url
 
         competitor["snapshots"] = snapshots_result.data
         return competitor

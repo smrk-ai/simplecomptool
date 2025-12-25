@@ -47,8 +47,10 @@ interface Competitor {
   created_at: string;
   snapshots?: Array<{
     id: string;
-    url: string;
     created_at: string;
+    page_count: number;
+    base_url?: string;
+    notes?: string;
   }>;
 }
 
@@ -339,8 +341,16 @@ export default function Home() {
                 <strong>Snapshots:</strong>
                 {competitor.snapshots && competitor.snapshots.length > 0 ? (
                   competitor.snapshots.map((snapshot) => (
-                    <div key={snapshot.id} className="snapshot-item">
-                      {formatDate(snapshot.created_at)} - {snapshot.url}
+                    <div 
+                      key={snapshot.id} 
+                      className="snapshot-item"
+                      onClick={() => loadSnapshotDetails(snapshot.id)}
+                      style={{ cursor: 'pointer', padding: '5px', borderRadius: '4px', transition: 'background-color 0.2s' }}
+                      onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#f0f0f0'}
+                      onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+                    >
+                      {formatDate(snapshot.created_at)} - {snapshot.page_count} Seiten
+                      {snapshot.base_url && ` (${snapshot.base_url})`}
                     </div>
                   ))
                 ) : (

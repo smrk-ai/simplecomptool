@@ -24,6 +24,20 @@ except Exception:
 # CORS-Konfiguration aus Environment-Variable
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 
+# Persistence Backend Konfiguration
+PERSISTENCE_BACKEND = os.getenv("PERSISTENCE_BACKEND", "sqlite").lower()
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "snapshots")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
+
+# Validierung der Supabase-Konfiguration
+if PERSISTENCE_BACKEND == "supabase":
+    if not SUPABASE_URL:
+        raise ValueError("PERSISTENCE_BACKEND=supabase erfordert SUPABASE_URL")
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise ValueError("PERSISTENCE_BACKEND=supabase erfordert SUPABASE_SERVICE_ROLE_KEY")
+
 from services.crawler import (
     discover_urls,
     prioritize_urls,
@@ -31,11 +45,19 @@ from services.crawler import (
 )
 from services.fetchers.fetch_manager import FetchManager
 from services.persistence import (
-    init_db, get_or_create_competitor, create_snapshot, save_page,
-    update_snapshot_page_count, get_snapshot_pages, get_competitor_socials,
-    create_profile_with_llm, update_snapshot_status, increment_snapshot_progress
+    extract_text_from_html,
+    calculate_text_hash,
+    canonicalize_url,
+    EXTRACTION_VERSION
 )
+# Initialize the persistence store
+store = get_store()
 from services.url_utils import normalize_input_url, validate_url_for_scanning
+
+# Initialize store on startup
+@app.on_event("startup")
+async def initialize_store():
+    await store.init()
 
 app = FastAPI(title="Simple CompTool Backend", version="1.0.0")
 
@@ -73,6 +95,9 @@ class PageInfo(BaseModel):
     sha256_text: str
     title: Optional[str] = None
     meta_description: Optional[str] = None
+    canonical_url: str
+    changed: bool
+    prev_page_id: Optional[str] = None
 
 class ErrorDetail(BaseModel):
     code: str
@@ -153,167 +178,238 @@ class Profile(BaseModel):
     text: str
 
 # Datenbank-Funktionen
-def get_competitors() -> List[dict]:
-    import sqlite3
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
+async def get_competitors() -> List[dict]:
+    """Get all competitors with their snapshots."""
     try:
-        # Competitors laden
-        cursor.execute('SELECT id, name, base_url, created_at FROM competitors ORDER BY created_at DESC')
-        competitors = []
-
-        for row in cursor.fetchall():
-            competitor = {
-                'id': row[0],
-                'name': row[1],
-                'base_url': row[2],
-                'created_at': row[3],
-                'url': row[2],  # base_url als url für Frontend-Kompatibilität
-                'snapshots': []
-            }
-
-            # Snapshots für diesen Competitor laden
-            cursor.execute('''
-                SELECT id, created_at, page_count, notes, status, progress_pages_done, progress_pages_total
-                FROM snapshots WHERE competitor_id = ? ORDER BY created_at DESC
-            ''', (row[0],))
-
-            competitor['snapshots'] = [
-                {
-                    'id': srow[0],
-                    'created_at': srow[1],
-                    'page_count': srow[2],
-                    'notes': srow[3],
-                    'status': srow[4],
-                    'progress_pages_done': srow[5],
-                    'progress_pages_total': srow[6],
-                    'base_url': row[2]  # base_url hinzufügen
-                }
-                for srow in cursor.fetchall()
-            ]
-
-            competitors.append(competitor)
-
-        return competitors
+        return await store.list_competitors()
     except Exception as e:
         logger.error(f"Fehler beim Laden der Competitors: {e}")
         return []
-    finally:
-        conn.close()
 
-def get_competitor(competitor_id: str) -> Optional[dict]:
-    import sqlite3
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
+async def get_competitor(competitor_id: str) -> Optional[dict]:
+    """Get a single competitor with snapshots and socials."""
     try:
-        # Competitor laden
-        cursor.execute('SELECT id, name, base_url, created_at FROM competitors WHERE id = ?', (competitor_id,))
-        row = cursor.fetchone()
-
-        if not row:
-            return None
-
-        competitor = {
-            'id': row[0],
-            'name': row[1],
-            'base_url': row[2],
-            'created_at': row[3],
-            'url': row[2],  # base_url als url für Frontend-Kompatibilität
-            'snapshots': [],
-            'socials': get_competitor_socials(competitor_id)
-        }
-
-        # Snapshots für diesen Competitor laden
-        cursor.execute('''
-            SELECT id, created_at, page_count, notes
-            FROM snapshots WHERE competitor_id = ? ORDER BY created_at DESC
-        ''', (competitor_id,))
-
-        competitor['snapshots'] = [
-            {
-                'id': srow[0],
-                'created_at': srow[1],
-                'page_count': srow[2],
-                'notes': srow[3],
-                'base_url': row[2]  # base_url hinzufügen
-            }
-            for srow in cursor.fetchall()
-        ]
-
-        return competitor
+        return await store.get_competitor(competitor_id)
     except Exception as e:
         logger.error(f"Fehler beim Laden des Competitors: {e}")
         return None
-    finally:
-        conn.close()
 
-def get_snapshot(snapshot_id: str, with_previews: bool = False, preview_limit: int = 10) -> Optional[dict]:
-    import sqlite3
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
 
+async def persist_page_snapshot(snapshot_id: str, fetch_result: Dict, competitor_id: str,
+                       prev_page_map: Optional[Dict[str, Dict]] = None) -> Dict:
+    """
+    ZENTRALE PAGE-PERSISTENCE FUNKTION MIT GUARDS (REGEL 1) + HASH-GATE
+
+    Speichert eine Page mit allen erforderlichen Komponenten über Store-Interface.
+    """
+    # REGEL 1 GUARDS: Validierung der erforderlichen Komponenten
+    if not fetch_result.get('html'):
+        raise ValueError("REGEL 1 VERLETZT: raw_html ist erforderlich aber fehlt")
+
+    # Text-Extraktion
+    title, meta_description, normalized_text = extract_text_from_html(fetch_result['html'])
+
+    if not normalized_text.strip():
+        raise ValueError("REGEL 1 VERLETZT: normalized_text ist erforderlich aber leer")
+
+    # SHA256 Hash berechnen
+    sha256_text = calculate_text_hash(normalized_text)
+    if not sha256_text:
+        raise ValueError("REGEL 1 VERLETZT: sha256 hash konnte nicht berechnet werden")
+
+    # Canonical URL erstellen
+    canonical_url = canonicalize_url(fetch_result.get('final_url', fetch_result['url']))
+
+    # HASH-GATE: Previous Page prüfen
+    changed = True
+    prev_page_id = None
+
+    if prev_page_map and canonical_url in prev_page_map:
+        prev_page = prev_page_map[canonical_url]
+        prev_sha256 = prev_page.get('sha256_text')
+
+        if prev_sha256 and prev_sha256 == sha256_text:
+            # UNVERÄNDERT: Hash-Gate aktiviert
+            changed = False
+            prev_page_id = prev_page['page_id']
+            logger.debug(f"Hash-Gate: Page {canonical_url} unverändert (SHA256 gleich)")
+
+    # Content-Type ermitteln
+    content_type = fetch_result.get('headers', {}).get('content-type', 'text/html')
+
+    # Page-Payload für Store
+    page_payload = {
+        'snapshot_id': snapshot_id,
+        'url': fetch_result.get('original_url', fetch_result['final_url']),
+        'final_url': fetch_result['final_url'],
+        'status': fetch_result['status'],
+        'fetched_at': fetch_result['fetched_at'],
+        'via': fetch_result['via'],
+        'content_type': content_type,
+        'sha256_text': sha256_text,
+        'title': title,
+        'meta_description': meta_description,
+        'canonical_url': canonical_url,
+        'changed': changed,
+        'prev_page_id': prev_page_id,
+        'normalized_len': len(normalized_text),
+        'extraction_version': EXTRACTION_VERSION
+    }
+
+    # FILE UPLOAD: Je nach Store-Typ
+    if hasattr(store, 'upload_raw_and_text'):
+        # Supabase Store: Upload to Storage first
+        try:
+            file_paths = await store.upload_raw_and_text(snapshot_id, str(uuid.uuid4()), fetch_result['html'], normalized_text)
+            page_payload.update(file_paths)
+        except Exception as e:
+            logger.error(f"File upload failed for page, will save without files: {e}")
+            # Continue without files - page will be saved but downloads won't work
+    else:
+        # SQLite Store: Local file paths
+        import os
+        import uuid as uuid_module
+
+        page_id = str(uuid_module.uuid4())  # Generate temp ID for paths
+        snapshot_dir = f"data/snapshots/{snapshot_id}/pages"
+        os.makedirs(snapshot_dir, exist_ok=True)
+
+        html_path = f"{snapshot_id}/pages/{page_id}.html"
+        txt_path = f"{snapshot_id}/pages/{page_id}.txt"
+
+        # Save files locally
+        try:
+            html_file_path = f"data/snapshots/{html_path}"
+            with open(html_file_path, 'w', encoding='utf-8') as f:
+                f.write(fetch_result['html'])
+
+            txt_file_path = f"data/snapshots/{txt_path}"
+            with open(txt_file_path, 'w', encoding='utf-8') as f:
+                f.write(normalized_text)
+
+            page_payload['raw_path'] = html_path
+            page_payload['text_path'] = txt_path
+
+        except Exception as e:
+            logger.error(f"Local file save failed: {e}")
+            raise
+
+    # Save page via Store
+    page_id = await store.insert_or_update_page(snapshot_id, page_payload)
+
+    return {
+        'id': page_id,
+        'url': page_payload['url'],
+        'status': page_payload['status'],
+        'sha256_text': page_payload['sha256_text'],
+        'title': page_payload['title'],
+        'meta_description': page_payload['meta_description'],
+        'canonical_url': canonical_url,
+        'changed': changed,
+        'prev_page_id': prev_page_id,
+        'text_path': page_payload.get('text_path')
+    }
+
+
+async def create_profile_with_llm(competitor_id: str, snapshot_id: str, pages: List[Dict]) -> Optional[str]:
+    """
+    Erstellt ein Profil mit LLM basierend auf den gecrawlten Seiten
+
+    Args:
+        competitor_id: ID des Competitors
+        snapshot_id: ID des Snapshots
+        pages: Liste der gecrawlten Pages
+
+    Returns:
+        Profil-Text oder None bei Fehler
+    """
     try:
-        # Snapshot laden
-        cursor.execute('''
-            SELECT id, competitor_id, created_at, page_count, notes, status,
-                   progress_pages_done, progress_pages_total, started_at, finished_at,
-                   error_code, error_message
-            FROM snapshots WHERE id = ?
-        ''', (snapshot_id,))
+        # OpenAI API Key aus Environment
+        api_key = os.getenv('OPENAI_API_KEY')
+        if not api_key:
+            logger.warning("OPENAI_API_KEY nicht gesetzt, überspringe Profil-Erstellung")
+            return "LLM-Profil nicht verfügbar (API-Key fehlt)"
 
-        row = cursor.fetchone()
-        if not row:
+        # Filtere relevante Seiten (keine privacy/terms, sortiere nach Textlänge)
+        relevant_pages = []
+        for page in pages:
+            url_path = urlparse(page['url']).path.lower()
+            if not any(exclude in url_path for exclude in ['privacy', 'terms']):
+                relevant_pages.append(page)
+
+        # Sortiere nach Textlänge (wir nehmen an, dass längerer Text mehr Inhalt hat)
+        relevant_pages.sort(key=lambda p: len(p.get('title', '')) + len(p.get('meta_description', '')), reverse=True)
+
+        # Nimm bis zu 3 Seiten mit höchstem Textumfang
+        selected_pages = relevant_pages[:3]
+
+        # Sammle Inhalte für LLM
+        llm_input_parts = []
+
+        # Füge Titel und Meta-Descriptions hinzu
+        for page in selected_pages:
+            if page.get('title'):
+                llm_input_parts.append(f"Titel: {page['title']}")
+            if page.get('meta_description'):
+                llm_input_parts.append(f"Beschreibung: {page['meta_description']}")
+
+            # Lade den normalisierten Text über Store (max 6000 chars pro Seite)
+            if page.get('id'):
+                try:
+                    text_content = await store.download_page_text(page['id'])
+                    if text_content:
+                        text_str = text_content.decode('utf-8')[:6000]
+                        if text_str.strip():
+                            llm_input_parts.append(f"Inhalt: {text_str}")
+                except Exception as e:
+                    logger.warning(f"Fehler beim Laden der Textdatei für Page {page['id']}: {e}")
+
+        # Füge Top URLs hinzu (max 10)
+        all_urls = [page['url'] for page in pages[:10]]
+        if all_urls:
+            llm_input_parts.append(f"Wichtige URLs: {', '.join(all_urls)}")
+
+        # Kombiniere Input
+        full_input = "\n\n".join(llm_input_parts)
+
+        if not full_input.strip():
+            logger.warning("Kein Input für LLM verfügbar")
             return None
 
-        snapshot = {
-            'id': row[0],
-            'competitor_id': row[1],
-            'created_at': row[2],
-            'page_count': row[3],
-            'notes': row[4],
-            'status': row[5],
-            'progress_pages_done': row[6],
-            'progress_pages_total': row[7],
-            'started_at': row[8],
-            'finished_at': row[9],
-            'error_code': row[10],
-            'error_message': row[11],
-            'pages': []
-        }
+        # OpenAI Client
+        import openai
+        client = openai.AsyncOpenAI(api_key=api_key)
 
-        # Pages laden
-        pages = get_snapshot_pages(snapshot_id)
-        for i, page in enumerate(pages):
-            # Download-URLs hinzufügen
-            page['raw_download_url'] = f"/api/pages/{page['id']}/raw"
-            page['text_download_url'] = f"/api/pages/{page['id']}/text"
+        # System Message für deterministisches, kurzes Ergebnis
+        system_message = """Du bist ein Analyst für Unternehmensprofile. Erstelle ein präzises Unternehmensprofil basierend auf den bereitgestellten Informationen. Schreibe maximal 5 Zeilen Fließtext auf Deutsch. Keine Überschrift, keine Aufzählung, kein "Think", keine Fragen. Fokussiere dich auf das Wesentliche: Was macht das Unternehmen, welche Zielgruppe, welche Besonderheiten."""
 
-            # Text-Preview nur laden wenn gewünscht und innerhalb des Limits
-            if with_previews and i < preview_limit:
-                try:
-                    if page.get('text_path'):
-                        text_file_path = f"data/snapshots/{page['text_path']}"
-                        with open(text_file_path, 'r', encoding='utf-8') as f:
-                            text_content = f.read()
-                        page['text_preview'] = text_content[:300]  # Erste 300 Zeichen
-                    else:
-                        page['text_preview'] = ""
-                except Exception as e:
-                    logger.warning(f"Fehler beim Laden der Text-Preview für Page {page['id']}: {e}")
-                    page['text_preview'] = ""
-            else:
-                # Keine Preview laden - entferne das Feld oder lasse es weg
-                pass  # page['text_preview'] wird nicht gesetzt
+        # LLM Call
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": full_input}
+            ],
+            max_tokens=300,  # Begrenze Tokens für kurze Antwort
+            temperature=0.3  # Niedrige Temperature für deterministische Antworten
+        )
 
-        snapshot["pages"] = pages
-        return snapshot
+        profile_text = response.choices[0].message.content.strip()
+
+        logger.info(f"LLM-Profil für Competitor {competitor_id} erstellt")
+        return profile_text
+
+    except Exception as e:
+        logger.error(f"Fehler bei LLM-Profil-Erstellung: {e}")
+        return None
+
+async def get_snapshot(snapshot_id: str, with_previews: bool = False, preview_limit: int = 10) -> Optional[dict]:
+    """Get complete snapshot data including pages."""
+    try:
+        return await store.get_snapshot(snapshot_id, with_previews, preview_limit)
     except Exception as e:
         logger.error(f"Fehler beim Laden des Snapshots: {e}")
         return None
-    finally:
-        conn.close()
 
 # Logger konfigurieren
 logger = logging.getLogger(__name__)
@@ -356,8 +452,8 @@ async def complete_scan_background(scan_id: str, snapshot_id: str, rest_urls: Li
                     'content_type': fetch_result.content_type
                 }
 
-                # Page speichern
-                page_info = await save_page(snapshot_id, fetch_dict, competitor_id)
+                # Page speichern mit Hash-Gate
+                page_info = await persist_page_snapshot(snapshot_id, fetch_dict, competitor_id, prev_page_map)
                 if page_info:
                     saved_count += 1
                     # Progress erhöhen
@@ -368,13 +464,28 @@ async def complete_scan_background(scan_id: str, snapshot_id: str, rest_urls: Li
 
         # Social Links extrahieren (global aus allen Seiten)
         try:
-            extract_social_links_from_snapshot(snapshot_id, competitor_id)
+            await extract_social_links_from_snapshot(snapshot_id, competitor_id)
         except Exception as e:
             logger.error(f"[{scan_id}] Fehler bei Social Link Extraktion: {e}")
 
+        # VALIDATION: Anzahl gespeicherter Pages == erwartete Gesamtanzahl
+        await update_snapshot_page_count(snapshot_id)
+        final_page_count = await get_snapshot_page_count(snapshot_id)
+        expected_total = len(top_3_urls) + len(rest_urls)  # Gesamtanzahl aus Page-Set
+
+        if final_page_count != expected_total:
+            logger.error(f"[{scan_id}] VALIDATION FAILED: Erwartet {expected_total} Pages, aber {final_page_count} gespeichert")
+            await update_snapshot_status(snapshot_id, "failed",
+                                       error_code="VALIDATION_FAILED",
+                                       error_message=f"Page count mismatch: expected {expected_total}, got {final_page_count}")
+            return
+
+        # LOGGING: Change Detection Stats
+        change_counts = await get_snapshot_change_counts(snapshot_id)
+        logger.info(f"[{scan_id}] SCAN COMPLETED - prev_snapshot: {prev_snapshot_id}, changed_pages: {change_counts['changed_pages_count']}, unchanged_pages: {change_counts['unchanged_pages_count']}, total: {change_counts['total_pages_count']}")
+
         # Snapshot als fertig markieren
         await update_snapshot_status(snapshot_id, "done", finished_at=datetime.now().isoformat())
-        await update_snapshot_page_count(snapshot_id)
 
         logger.info(f"[{scan_id}] PHASE B: Abgeschlossen - {saved_count} Seiten gespeichert, Status: done")
 
@@ -386,7 +497,7 @@ async def complete_scan_background(scan_id: str, snapshot_id: str, rest_urls: Li
                                     error_message=str(e))
 
 
-def extract_social_links_from_snapshot(snapshot_id: str, competitor_id: str):
+async def extract_social_links_from_snapshot(snapshot_id: str, competitor_id: str):
     """
     Extrahiert Social Links aus allen Seiten eines Snapshots
 
@@ -394,27 +505,23 @@ def extract_social_links_from_snapshot(snapshot_id: str, competitor_id: str):
         snapshot_id: ID des Snapshots
         competitor_id: ID des Competitors
     """
-    from services.persistence import extract_social_links, save_social_links
-    import sqlite3
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    from services.persistence import extract_social_links
 
     try:
         # Alle Pages dieses Snapshots laden
-        cursor.execute('SELECT url, raw_path FROM pages WHERE snapshot_id = ?', (snapshot_id,))
+        snapshot_data = await store.get_snapshot(snapshot_id)
+        if not snapshot_data or not snapshot_data.get('pages'):
+            return
 
         all_social_links = []
-        for row in cursor.fetchall():
-            url, raw_path = row
+        for page in snapshot_data['pages']:
             try:
-                # HTML aus lokaler Datei laden
-                html_file_path = f"data/snapshots/{raw_path}"
-                with open(html_file_path, 'r', encoding='utf-8') as f:
-                    html_content = f.read()
-
+                # HTML über Store laden
+                html_content = await store.download_page_raw(page['id'])
+                if html_content:
+                    html_str = html_content.decode('utf-8')
                 # Social Links extrahieren
-                social_links = extract_social_links(html_content, url)
+                    social_links = extract_social_links(html_str, page['url'])
                 all_social_links.extend(social_links)
 
             except Exception as e:
@@ -422,13 +529,11 @@ def extract_social_links_from_snapshot(snapshot_id: str, competitor_id: str):
 
         # Social Links deduplizieren und speichern
         if all_social_links:
-            save_social_links(competitor_id, all_social_links, "snapshot-completion")
+            await store.upsert_socials(competitor_id, all_social_links)
             logger.info(f"Social Links für Snapshot {snapshot_id} gespeichert: {len(all_social_links)}")
 
     except Exception as e:
         logger.error(f"Fehler bei Social Link Extraktion für Snapshot {snapshot_id}: {e}")
-    finally:
-        conn.close()
 
 # API Endpoints
 @app.post("/api/scan", response_model=ScanResponse)
@@ -472,16 +577,16 @@ async def scan_endpoint(request: ScanRequest):
 
         try:
             # 1. Competitor finden oder erstellen (upsert by base_url)
-            competitor_id = await get_or_create_competitor(normalized_url, request.name)
+            competitor_id = await store.upsert_competitor(request.name, normalized_url)
             logger.info(f"[{scan_id}] Competitor ID: {competitor_id}")
 
             # 2. URLs entdecken
             logger.info(f"[{scan_id}] Starte URL-Discovery...")
-            all_urls = await discover_urls(normalized_url)
-            discover_count = len(all_urls)
+            discovered_urls = await discover_urls(normalized_url)
+            discover_count = len(discovered_urls)
             logger.info(f"[{scan_id}] Discovery abgeschlossen: {discover_count} URLs gefunden")
 
-            if not all_urls:
+            if not discovered_urls:
                 return ScanResponse(
                     ok=False,
                     error=ErrorDetail(code="NO_URLS", message="Keine URLs zum Crawlen gefunden"),
@@ -489,24 +594,50 @@ async def scan_endpoint(request: ScanRequest):
                     render_mode="httpx"  # fallback
                 )
 
-            # Limit auf MAX_URLS sicherstellen
-            if len(all_urls) > MAX_URLS:
-                all_urls = all_urls[:MAX_URLS]
-                logger.warning(f"[{scan_id}] URLs auf {MAX_URLS} begrenzt")
+            # 3. DETERMINISTISCHES PAGE-SET ERSTELLEN (REGEL 2)
+            page_set = create_deterministic_page_set(discovered_urls, normalized_url)
+            final_urls = page_set["urls"]
 
-            # 3. URLs priorisieren (Top 3 vs Rest)
-            top_3_urls, rest_urls = prioritize_urls(all_urls, normalized_url)
+            logger.info(f"[{scan_id}] Page-Set erstellt: {len(final_urls)} URLs (max {page_set['rules']['max_pages']})")
+
+            # 4. PAGE-SET ÄNDERUNG PRÜFEN (RE-SCAN)
+            page_set_changed = await check_page_set_changed(competitor_id, page_set["page_set_hash"])
+            if page_set_changed:
+                logger.info(f"[{scan_id}] Page-Set geändert seit letztem Scan")
+
+            # 5. PREVIOUS SNAPSHOT LOOKUP für Change Detection
+            prev_snapshot_id = await store.get_latest_snapshot_id(competitor_id)
+            prev_page_map = {}
+
+            if prev_snapshot_id:
+                logger.info(f"[{scan_id}] Previous Snapshot gefunden: {prev_snapshot_id}")
+                prev_page_map = await store.get_pages_map(prev_snapshot_id)
+                logger.info(f"[{scan_id}] Previous Page-Map geladen: {len(prev_page_map)} Pages")
+            else:
+                logger.info(f"[{scan_id}] Kein Previous Snapshot gefunden (erster Scan)")
+
+            # 6. URLs priorisieren (Top 3 vs Rest) - AUSSCHLIESSLICH aus Page-Set
+            top_3_urls, rest_urls = prioritize_urls(final_urls, normalized_url)
             logger.info(f"[{scan_id}] URLs priorisiert: {len(top_3_urls)} Top-URLs, {len(rest_urls)} Rest-URLs")
 
-            # 4. Render-Mode entscheiden und alle Fetches durchführen
+            # 7. Render-Mode entscheiden und alle Fetches durchführen
             async with FetchManager() as fetch_manager:
                 logger.info(f"[{scan_id}] Entscheide Render-Mode...")
                 render_mode = await fetch_manager.decide_render_mode(normalized_url)
                 logger.info(f"[{scan_id}] Render-Mode entschieden: {render_mode}")
 
-                # 5. Snapshot erstellen mit Total-Count
-                snapshot_id = await create_snapshot(competitor_id, page_count=len(all_urls))
-                await update_snapshot_status(snapshot_id, "running", progress_pages_total=len(all_urls))
+                # 8. Snapshot erstellen mit Page-Set Metadaten
+                snapshot_id = await store.create_snapshot(
+                    competitor_id=competitor_id,
+                    page_set_json=page_set,
+                    page_set_hash=page_set["page_set_hash"],
+                    progress_total=len(final_urls),
+                    extraction_version=EXTRACTION_VERSION,
+                    page_set_version=PAGE_SET_VERSION
+                )
+
+                # LOGGING: Scan-Start Informationen
+                logger.info(f"[{scan_id}] SCAN START - extraction_version: {EXTRACTION_VERSION}, page_set_version: {PAGE_SET_VERSION}, page_set_hash: {page_set['page_set_hash'][:16]}..., page_count: {len(final_urls)}")
                 logger.info(f"[{scan_id}] Snapshot erstellt: {snapshot_id}")
 
                 # 6. PHASE A: NUR Top 3 URLs fetchen
@@ -528,8 +659,8 @@ async def scan_endpoint(request: ScanRequest):
                             'content_type': fetch_result.content_type
                         }
 
-                        # Page speichern
-                        page_info = await save_page(snapshot_id, fetch_dict, competitor_id)
+                        # Page speichern mit Hash-Gate
+                        page_info = await persist_page_snapshot(snapshot_id, fetch_dict, competitor_id, prev_page_map)
 
                         if page_info:
                             # Sammle Page-Daten für LLM
@@ -550,11 +681,37 @@ async def scan_endpoint(request: ScanRequest):
 
                 logger.info(f"[{scan_id}] Phase A abgeschlossen: {len(pages_info)} Seiten gespeichert")
 
-                # 8. Optional: LLM-Profil erstellen (nur aus Top-Seiten)
+                # 8. Optional: LLM-Profil erstellen (Priorität auf changed pages)
                 if request.llm and pages_data:
                     try:
-                        logger.info(f"[{scan_id}] Erstelle LLM-Profil aus Top-Seiten...")
-                        profile = await create_profile_with_llm(competitor_id, snapshot_id, pages_data)
+                        logger.info(f"[{scan_id}] Erstelle LLM-Profil...")
+
+                        # LLM RESTRICTION: Priorität auf changed pages
+                        # Sammle changed vs unchanged pages
+                        changed_pages_data = []
+                        unchanged_pages_data = []
+
+                        for page_data in pages_data:
+                            # Finde entsprechende page_info
+                            matching_page = next((p for p in pages_info if p.id == page_data.get('page_id')), None)
+                            if matching_page and not matching_page.changed:
+                                unchanged_pages_data.append(page_data)
+                            else:
+                                changed_pages_data.append(page_data)
+
+                        # Priorität: changed pages zuerst, dann unchanged falls nötig
+                        selected_pages_data = changed_pages_data[:3]  # Max 3 changed pages
+
+                        if len(selected_pages_data) < 3 and unchanged_pages_data:
+                            # Fülle mit unchanged pages auf (max 3 total)
+                            needed = 3 - len(selected_pages_data)
+                            selected_pages_data.extend(unchanged_pages_data[:needed])
+
+                        logger.info(f"[{scan_id}] LLM verwendet {len(changed_pages_data)} changed + {len(unchanged_pages_data)} unchanged pages, selected {len(selected_pages_data)}")
+
+                        profile = await create_profile_with_llm(competitor_id, snapshot_id, selected_pages_data)
+                        if profile:
+                            await store.save_profile(competitor_id, snapshot_id, profile)
                         logger.info(f"[{scan_id}] LLM-Profil erfolgreich erstellt")
                     except Exception as e:
                         logger.error(f"[{scan_id}] Fehler bei LLM-Profil-Erstellung: {e}")
@@ -634,30 +791,75 @@ async def scan_endpoint(request: ScanRequest):
         )
 
 @app.get("/api/competitors")
-def get_competitors_endpoint():
-    return get_competitors()
+async def get_competitors_endpoint():
+    try:
+        return await get_competitors()
+    except Exception as e:
+        logger.error(f"Fehler beim Laden der Competitors: {e}")
+        raise HTTPException(status_code=500, detail="Interner Serverfehler")
 
 @app.get("/api/competitors/{competitor_id}")
-def get_competitor_endpoint(competitor_id: str):
-    competitor = get_competitor(competitor_id)
-    if not competitor:
-        raise HTTPException(status_code=404, detail="Competitor nicht gefunden")
-    return competitor
+async def get_competitor_endpoint(competitor_id: str):
+    try:
+        competitor = await get_competitor(competitor_id)
+        if not competitor:
+            raise HTTPException(status_code=404, detail="Competitor nicht gefunden")
+        return competitor
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Fehler beim Laden des Competitors: {e}")
+        raise HTTPException(status_code=500, detail="Interner Serverfehler")
 
 @app.get("/api/snapshots/{snapshot_id}/status")
-def get_snapshot_status_endpoint(snapshot_id: str):
+async def get_snapshot_status_endpoint(snapshot_id: str):
     """Gibt den aktuellen Status eines Snapshots zurück"""
-    from services.persistence import get_snapshot_status
+    try:
+        # Snapshot über Store laden
+        snapshot_data = await store.get_snapshot(snapshot_id)
 
-    status_data = get_snapshot_status(snapshot_id)
-    if not status_data:
-        raise HTTPException(status_code=404, detail="Snapshot nicht gefunden")
+        if not snapshot_data:
+            raise HTTPException(status_code=404, detail="Snapshot nicht gefunden")
+
+        # Status-Response erstellen
+        status_data = {
+            'snapshot_id': snapshot_data['id'],
+            'status': snapshot_data['status'],
+            'progress': {
+                'done': snapshot_data['progress_pages_done'],
+                'total': snapshot_data['progress_pages_total']
+            }
+        }
+
+        # Error hinzufügen falls vorhanden
+        if snapshot_data.get('error_code'):
+            status_data['error'] = {
+                'code': snapshot_data['error_code'],
+                'message': snapshot_data['error_message'] or ''
+            }
+
+        # Change-Counts hinzufügen (berechne aus Pages)
+        pages = snapshot_data.get('pages', [])
+        changed_count = sum(1 for p in pages if p.get('changed', True))
+        unchanged_count = len(pages) - changed_count
+
+        status_data.update({
+            'changed_pages_count': changed_count,
+            'unchanged_pages_count': unchanged_count,
+            'total_pages_count': len(pages)
+        })
 
     return status_data
 
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Fehler beim Laden des Snapshot-Status: {e}")
+        raise HTTPException(status_code=500, detail="Interner Serverfehler")
+
 
 @app.get("/api/snapshots/{snapshot_id}")
-def get_snapshot_endpoint(snapshot_id: str, with_previews: bool = False, preview_limit: int = 10):
+async def get_snapshot_endpoint(snapshot_id: str, with_previews: bool = False, preview_limit: int = 10):
     """
     Holt einen Snapshot mit allen Seiten.
 
@@ -665,33 +867,26 @@ def get_snapshot_endpoint(snapshot_id: str, with_previews: bool = False, preview
     - with_previews: Wenn true, werden Text-Previews für die ersten preview_limit Seiten geladen
     - preview_limit: Maximale Anzahl von Seiten mit Previews (default: 10)
     """
-    snapshot = get_snapshot(snapshot_id, with_previews=with_previews, preview_limit=preview_limit)
+    try:
+        snapshot = await store.get_snapshot(snapshot_id, with_previews=with_previews, preview_limit=preview_limit)
     if not snapshot:
         raise HTTPException(status_code=404, detail="Snapshot nicht gefunden")
     return snapshot
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Fehler beim Laden des Snapshots: {e}")
+        raise HTTPException(status_code=500, detail="Interner Serverfehler")
 
 @app.get("/api/pages/{page_id}/raw")
 async def download_page_raw(page_id: str):
     """HTML-Datei als Download bereitstellen"""
-    import sqlite3
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
     try:
-        # Page-Daten laden
-        cursor.execute('SELECT raw_path, url FROM pages WHERE id = ?', (page_id,))
-        row = cursor.fetchone()
+        # HTML über Store laden
+        html_content = await store.download_page_raw(page_id)
 
-        if not row:
-            raise HTTPException(status_code=404, detail="Page nicht gefunden")
-
-        raw_path, url = row
-
-        # HTML-Datei aus lokalem Storage laden
-        html_file_path = f"data/snapshots/{raw_path}"
-        with open(html_file_path, 'r', encoding='utf-8') as f:
-            html_content = f.read()
+        if html_content is None:
+            raise HTTPException(status_code=404, detail="HTML-Datei nicht gefunden")
 
         # Als Download zurückgeben
         filename = f"{page_id}.html"
@@ -704,39 +899,24 @@ async def download_page_raw(page_id: str):
             }
         )
 
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="HTML-Datei nicht gefunden")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Fehler beim Laden der HTML-Datei für Page {page_id}: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"HTML-Datei konnte nicht geladen werden: {str(e)}"
         )
-    finally:
-        conn.close()
 
 @app.get("/api/pages/{page_id}/text")
 async def download_page_text(page_id: str):
     """TXT-Datei als Download bereitstellen"""
-    import sqlite3
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
     try:
-        # Page-Daten laden
-        cursor.execute('SELECT text_path, url FROM pages WHERE id = ?', (page_id,))
-        row = cursor.fetchone()
+        # Text über Store laden
+        text_content = await store.download_page_text(page_id)
 
-        if not row:
-            raise HTTPException(status_code=404, detail="Page nicht gefunden")
-
-        text_path, url = row
-
-        # TXT-Datei aus lokalem Storage laden
-        text_file_path = f"data/snapshots/{text_path}"
-        with open(text_file_path, 'r', encoding='utf-8') as f:
-            text_content = f.read()
+        if text_content is None:
+            raise HTTPException(status_code=404, detail="TXT-Datei nicht gefunden")
 
         # Als Download zurückgeben
         filename = f"{page_id}.txt"
@@ -749,61 +929,42 @@ async def download_page_text(page_id: str):
             }
         )
 
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="TXT-Datei nicht gefunden")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Fehler beim Laden der TXT-Datei für Page {page_id}: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"TXT-Datei konnte nicht geladen werden: {str(e)}"
         )
-    finally:
-        conn.close()
 
 @app.get("/api/pages/{page_id}/preview")
 async def get_page_preview(page_id: str):
     """Gibt eine Text-Preview für eine einzelne Seite zurück (300 Zeichen)"""
-    import sqlite3
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
     try:
-        # Page-Daten laden
-        cursor.execute('SELECT text_path, url FROM pages WHERE id = ?', (page_id,))
-        row = cursor.fetchone()
+        # Text-Preview über Store laden
+        preview = await store.get_page_preview(page_id, max_length=300)
 
-        if not row:
-            raise HTTPException(status_code=404, detail="Page nicht gefunden")
+        if preview is None:
+            raise HTTPException(status_code=404, detail="Text-Datei nicht gefunden")
 
-        text_path, url = row
+        return preview
 
-        # Text-Preview aus lokaler Datei laden
-        text_file_path = f"data/snapshots/{text_path}"
-        with open(text_file_path, 'r', encoding='utf-8') as f:
-            text_content = f.read()
-
-        return {
-            'page_id': page_id,
-            'text_preview': text_content[:300],  # Erste 300 Zeichen
-            'has_more': len(text_content) > 300
-        }
-
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Text-Datei nicht gefunden")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Fehler beim Laden der Text-Preview für Page {page_id}: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Text-Preview konnte nicht geladen werden: {str(e)}"
         )
-    finally:
-        conn.close()
 
-# Startup Event
-@app.on_event("startup")
-def startup_event():
-    init_db()
+# SQLite DB nur initialisieren wenn SQLite verwendet wird (wird jetzt vom Store gemacht)
+# @app.on_event("startup")
+# def startup_event():
+#     if PERSISTENCE_BACKEND == "sqlite":
+#         from services.persistence import init_db
+#         init_db()
 
 if __name__ == "__main__":
     import uvicorn

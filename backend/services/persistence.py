@@ -12,8 +12,160 @@ from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 import openai
 import asyncio
+import hashlib
+import json
 
 from .url_utils import normalize_input_url
+
+# EXTRACTION VERSIONING
+EXTRACTION_VERSION = "v1"
+
+# PAGE-SET VERSIONING
+PAGE_SET_VERSION = "v1"
+
+# PAGE-SET KONSTANTEN
+MAX_PAGES = 20
+PAGE_SET_RULES = {
+    "max_pages": MAX_PAGES,
+    "allow_subdomains": True,
+    "excluded_keywords": ["privacy", "terms", "login", "logout", "admin", "wp-admin"],
+    "ranking_weights": {
+        "priority_keywords": ["pricing", "plan", "product", "features", "solutions", "customers", "case-study", "docs", "blog", "changelog", "news", "careers", "jobs", "about", "company", "team", "security"],
+        "path_depth_penalty": 0.1,  # Weniger tief verschachtelte Pfade bevorzugen
+        "home_page_boost": 2.0     # Homepage boost
+    }
+}
+
+
+def canonicalize_url(url: str) -> str:
+    """
+    Erstellt eine kanonische URL für Change Detection.
+
+    Normalisierung:
+    - Schema erzwingen (https)
+    - Host normalisieren (www entfernen)
+    - Fragment entfernen (#)
+    - Tracking-Parameter entfernen (utm_*, fbclid, gclid, etc.)
+    - Query-Parameter sortieren für Determinismus
+    """
+    if not url:
+        return url
+
+    try:
+        from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+        parsed = urlparse(url)
+
+        # Schema erzwingen
+        if parsed.scheme != 'https':
+            parsed = parsed._replace(scheme='https')
+
+        # Host normalisieren (www entfernen)
+        if parsed.hostname and parsed.hostname.startswith('www.'):
+            parsed = parsed._replace(netloc=parsed.hostname[4:])
+
+        # Fragment entfernen
+        parsed = parsed._replace(fragment='')
+
+        # Query-Parameter filtern und sortieren
+        if parsed.query:
+            query_params = parse_qs(parsed.query, keep_blank_values=False)
+            # Tracking-Parameter entfernen
+            filtered_params = {
+                k: v for k, v in query_params.items()
+                if not any(k.startswith(prefix) for prefix in ['utm_', 'fbclid', 'gclid', 'gclsrc', '_ga'])
+            }
+            if filtered_params:
+                # Sortiere Parameter für Determinismus
+                sorted_params = sorted(filtered_params.items())
+                parsed = parsed._replace(query=urlencode(sorted_params, doseq=True))
+            else:
+                parsed = parsed._replace(query='')
+
+        return urlunparse(parsed)
+
+    except Exception as e:
+        logger.warning(f"Fehler bei URL-Kanonisierung {url}: {e}")
+        return url
+
+
+def calculate_page_set_hash(page_set: Dict) -> str:
+    """Berechnet SHA256 Hash des Page-Sets für Determinismus-Verifikation"""
+    # JSON serialisieren und hashen (sort_keys=True für Determinismus)
+    page_set_json = json.dumps(page_set, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(page_set_json.encode('utf-8')).hexdigest()
+
+
+def create_deterministic_page_set(discovered_urls: List[str], base_url: str) -> Dict:
+    """
+    ERSTELLT EIN DETERMINISTISCHES PAGE-SET ARTEFAKT (REGEL 2)
+
+    Args:
+        discovered_urls: Roh-URLs von discover_urls()
+        base_url: Normalisierte Basis-URL
+
+    Returns:
+        Page-Set Dict mit version, rules, urls und hash
+    """
+    from urllib.parse import urlparse
+
+    # 1. URLs normalisieren und deduplizieren
+    normalized_urls = set()
+    for url in discovered_urls:
+        normalized = normalize_input_url(url)
+        if normalized:
+            normalized_urls.add(normalized)
+
+    # 2. URLs nach Ranking sortieren (deterministisch)
+    def calculate_ranking_score(url: str) -> float:
+        """Berechnet Ranking-Score für deterministische Sortierung"""
+        parsed = urlparse(url)
+        path = parsed.path.rstrip('/')
+
+        score = 0.0
+
+        # Home page boost
+        if path in ['', '/']:
+            score += PAGE_SET_RULES["ranking_weights"]["home_page_boost"]
+
+        # Priority keywords boost
+        path_lower = path.lower()
+        for keyword in PAGE_SET_RULES["ranking_weights"]["priority_keywords"]:
+            if keyword in path_lower:
+                score += 1.0
+
+        # Path depth penalty (kürzere Pfade bevorzugen)
+        path_parts = [p for p in path.split('/') if p]
+        depth_penalty = len(path_parts) * PAGE_SET_RULES["ranking_weights"]["path_depth_penalty"]
+        score -= depth_penalty
+
+        # Lexikographische Sortierung als Tie-Breaker für Determinismus
+        score = score * 1000 + (1.0 / (1.0 + len(url)))  # Kleine Variation für Sortierung
+
+        return score
+
+    # Sortiere URLs nach Score (höchste zuerst), dann lexikographisch
+    ranked_urls = sorted(normalized_urls,
+                        key=lambda u: (-calculate_ranking_score(u), u))
+
+    # 3. Auf MAX_PAGES begrenzen
+    final_urls = ranked_urls[:MAX_PAGES]
+
+    # 4. Page-Set Artefakt erstellen
+    page_set = {
+        "page_set_version": PAGE_SET_VERSION,
+        "rules": PAGE_SET_RULES,
+        "urls": final_urls,
+        "created_at": datetime.now().isoformat(),
+        "base_url": base_url
+    }
+
+    # 5. Hash berechnen
+    page_set_hash = calculate_page_set_hash(page_set)
+    page_set["page_set_hash"] = page_set_hash
+
+    logger.info(f"Page-Set erstellt: {len(final_urls)} URLs, Hash: {page_set_hash[:16]}...")
+
+    return page_set
 
 # Globaler Lock für alle SQLite Write-Operationen
 DB_WRITE_LOCK = asyncio.Lock()
@@ -122,7 +274,7 @@ def init_db():
         )
     ''')
 
-    # Snapshots Tabelle
+    # Snapshots Tabelle - ERWEITERT um Page-Set Metadaten
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS snapshots (
             id TEXT PRIMARY KEY,
@@ -137,11 +289,67 @@ def init_db():
             finished_at TEXT,
             error_code TEXT,
             error_message TEXT,
+            -- NEUE FELDER für Guards
+            extraction_version TEXT,
+            page_set_version TEXT,
+            page_set_hash TEXT,
+            page_set_changed BOOLEAN DEFAULT FALSE,
             FOREIGN KEY (competitor_id) REFERENCES competitors (id)
         )
     ''')
 
-    # Pages Tabelle
+    # MIGRATION: Neue Spalten zu bestehenden Snapshots hinzufügen
+    try:
+        cursor.execute("ALTER TABLE snapshots ADD COLUMN extraction_version TEXT")
+        logger.info("Migration: extraction_version Spalte hinzugefügt")
+    except sqlite3.OperationalError:
+        # Spalte existiert bereits
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE snapshots ADD COLUMN page_set_version TEXT")
+        logger.info("Migration: page_set_version Spalte hinzugefügt")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE snapshots ADD COLUMN page_set_hash TEXT")
+        logger.info("Migration: page_set_hash Spalte hinzugefügt")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE snapshots ADD COLUMN page_set_changed BOOLEAN DEFAULT FALSE")
+        logger.info("Migration: page_set_changed Spalte hinzugefügt")
+    except sqlite3.OperationalError:
+        pass
+
+    # MIGRATION: Neue Spalten zu bestehenden Pages hinzufügen
+    try:
+        cursor.execute("ALTER TABLE pages ADD COLUMN canonical_url TEXT NOT NULL DEFAULT ''")
+        logger.info("Migration: canonical_url Spalte hinzugefügt")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE pages ADD COLUMN changed BOOLEAN NOT NULL DEFAULT TRUE")
+        logger.info("Migration: changed Spalte hinzugefügt")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE pages ADD COLUMN prev_page_id TEXT")
+        logger.info("Migration: prev_page_id Spalte hinzugefügt")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE pages ADD COLUMN normalized_len INTEGER")
+        logger.info("Migration: normalized_len Spalte hinzugefügt")
+    except sqlite3.OperationalError:
+        pass
+
+    # Pages Tabelle - ERWEITERT um Change Detection
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS pages (
             id TEXT PRIMARY KEY,
@@ -157,7 +365,13 @@ def init_db():
             sha256_text TEXT,
             title TEXT,
             meta_description TEXT,
-            FOREIGN KEY (snapshot_id) REFERENCES snapshots (id)
+            -- NEUE FELDER für Change Detection
+            canonical_url TEXT NOT NULL,
+            changed BOOLEAN NOT NULL DEFAULT TRUE,
+            prev_page_id TEXT,
+            normalized_len INTEGER,
+            FOREIGN KEY (snapshot_id) REFERENCES snapshots (id),
+            FOREIGN KEY (prev_page_id) REFERENCES pages (id)
         )
     ''')
 
@@ -196,10 +410,17 @@ def init_db():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_socials_competitor_id ON socials(competitor_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_profiles_competitor_id ON profiles(competitor_id)')
 
+    # Indizes für Change Detection (nach Migration)
+    try:
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_pages_canonical_url ON pages(canonical_url)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_pages_snapshot_canonical ON pages(snapshot_id, canonical_url)')
+    except sqlite3.OperationalError as e:
+        logger.warning(f"Index-Erstellung übersprungen (Migration läuft): {e}")
+
     conn.commit()
     conn.close()
 
-    logger.info("SQLite-Datenbank initialisiert")
+    logger.info("SQLite-Datenbank initialisiert und migriert")
 
 
 def extract_text_from_html(html: str) -> Tuple[str, str, str]:
@@ -325,9 +546,15 @@ async def get_or_create_competitor(base_url: str, name: Optional[str] = None) ->
     return await _execute_write_with_retry(_do_competitor_operation)
 
 
-async def create_snapshot(competitor_id: str, page_count: int = 0, notes: Optional[str] = None) -> str:
-    """Erstellt einen neuen Snapshot"""
+async def create_snapshot(competitor_id: str, page_count: int = 0, notes: Optional[str] = None,
+                        page_set: Optional[Dict] = None) -> str:
+    """Erstellt einen neuen Snapshot mit erweiterten Metadaten"""
     snapshot_id = str(uuid.uuid4())
+
+    # Page-Set Metadaten extrahieren (falls vorhanden)
+    page_set_version = page_set.get("page_set_version") if page_set else None
+    page_set_hash = page_set.get("page_set_hash") if page_set else None
+    extraction_version = EXTRACTION_VERSION
 
     async def _do_create_snapshot():
         conn = sqlite3.connect(DB_PATH)
@@ -335,12 +562,16 @@ async def create_snapshot(competitor_id: str, page_count: int = 0, notes: Option
 
         try:
             cursor.execute('''
-                INSERT INTO snapshots (id, competitor_id, created_at, page_count, notes, status, progress_pages_done, progress_pages_total, started_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (snapshot_id, competitor_id, datetime.now().isoformat(), page_count, notes, 'queued', 0, page_count, datetime.now().isoformat()))
+                INSERT INTO snapshots (id, competitor_id, created_at, page_count, notes, status,
+                                     progress_pages_done, progress_pages_total, started_at,
+                                     extraction_version, page_set_version, page_set_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (snapshot_id, competitor_id, datetime.now().isoformat(), page_count, notes, 'queued',
+                  0, page_count, datetime.now().isoformat(),
+                  extraction_version, page_set_version, page_set_hash))
 
             conn.commit()
-            logger.info(f"Snapshot erstellt: {snapshot_id}")
+            logger.info(f"Snapshot erstellt: {snapshot_id} (extraction_v={extraction_version}, page_set_v={page_set_version})")
             return snapshot_id
         except Exception as e:
             logger.error(f"Fehler beim Erstellen des Snapshots: {e}")
@@ -351,44 +582,334 @@ async def create_snapshot(competitor_id: str, page_count: int = 0, notes: Option
     return await _execute_write_with_retry(_do_create_snapshot)
 
 
-async def save_page(snapshot_id: str, fetch_result: Dict, competitor_id: str) -> Dict:
+async def check_page_set_changed(competitor_id: str, new_page_set_hash: str) -> bool:
     """
-    Speichert eine Page mit allen Dateien und Metadaten lokal
-
-    Args:
-        snapshot_id: ID des Snapshots
-        fetch_result: Dict mit Fetch-Ergebnis
-        competitor_id: ID des Competitors
+    Prüft, ob sich das Page-Set seit dem letzten Snapshot geändert hat
 
     Returns:
-        Dict mit Page-Daten für API Response
+        True wenn sich das Page-Set geändert hat, False sonst
+    """
+    async def _do_check():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        try:
+            # Hole den neuesten erfolgreichen Snapshot für diesen Competitor
+            cursor.execute('''
+                SELECT page_set_hash FROM snapshots
+                WHERE competitor_id = ? AND status = 'done' AND page_set_hash IS NOT NULL
+                ORDER BY created_at DESC LIMIT 1
+            ''', (competitor_id,))
+
+            row = cursor.fetchone()
+            if row and row[0]:
+                last_hash = row[0]
+                changed = last_hash != new_page_set_hash
+                if changed:
+                    logger.info(f"Page-Set geändert für Competitor {competitor_id}: {last_hash[:16]}... -> {new_page_set_hash[:16]}...")
+                return changed
+            else:
+                # Erster Snapshot - keine Änderung
+                return False
+
+        except Exception as e:
+            logger.error(f"Fehler bei Page-Set Vergleich: {e}")
+            return False
+        finally:
+            conn.close()
+
+    return await _execute_write_with_retry(_do_check)
+
+
+async def mark_page_set_changed(snapshot_id: str, changed: bool = True):
+    """Markiert einen Snapshot als 'page_set_changed'"""
+    async def _do_mark():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute('''
+                UPDATE snapshots SET page_set_changed = ? WHERE id = ?
+            ''', (changed, snapshot_id))
+            conn.commit()
+
+            if changed:
+                logger.info(f"Snapshot {snapshot_id} als page_set_changed markiert")
+
+        except Exception as e:
+            logger.error(f"Fehler beim Markieren von page_set_changed: {e}")
+            raise
+        finally:
+            conn.close()
+
+    await _execute_write_with_retry(_do_mark)
+
+
+async def find_previous_snapshot(competitor_id: str) -> Optional[str]:
+    """
+    Findet den neuesten erfolgreichen Snapshot für einen Competitor.
+
+    Returns:
+        snapshot_id des neuesten erfolgreichen Snapshots oder None
+    """
+    async def _do_find():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute('''
+                SELECT id FROM snapshots
+                WHERE competitor_id = ? AND status = 'done'
+                ORDER BY created_at DESC LIMIT 1
+            ''', (competitor_id,))
+
+            row = cursor.fetchone()
+            return row[0] if row else None
+
+        except Exception as e:
+            logger.error(f"Fehler beim Suchen des vorherigen Snapshots: {e}")
+            return None
+        finally:
+            conn.close()
+
+    return await _execute_write_with_retry(_do_find)
+
+
+async def load_previous_page_map(snapshot_id: str) -> Dict[str, Dict]:
+    """
+    Lädt eine Map von canonical_url -> Page-Daten für Change Detection.
+
+    Returns:
+        Dict[canonical_url, {
+            'page_id': str,
+            'sha256_text': str,
+            'text_path': str,
+            'raw_path': str,
+            'title': str,
+            'meta_description': str,
+            'normalized_len': int
+        }]
+    """
+    async def _do_load():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute('''
+                SELECT id, canonical_url, sha256_text, text_path, raw_path, title, meta_description, normalized_len
+                FROM pages WHERE snapshot_id = ?
+            ''', (snapshot_id,))
+
+            page_map = {}
+            for row in cursor.fetchall():
+                page_id, canonical_url, sha256_text, text_path, raw_path, title, meta_description, normalized_len = row
+                page_map[canonical_url] = {
+                    'page_id': page_id,
+                    'sha256_text': sha256_text,
+                    'text_path': text_path,
+                    'raw_path': raw_path,
+                    'title': title,
+                    'meta_description': meta_description,
+                    'normalized_len': normalized_len
+                }
+
+            logger.debug(f"Loaded {len(page_map)} pages from previous snapshot {snapshot_id}")
+            return page_map
+
+        except Exception as e:
+            logger.error(f"Fehler beim Laden der vorherigen Page-Map: {e}")
+            return {}
+        finally:
+            conn.close()
+
+    return await _execute_write_with_retry(_do_load)
+
+
+async def get_snapshot_change_counts(snapshot_id: str) -> Dict[str, int]:
+    """
+    Berechnet Change-Counts für einen Snapshot.
+
+    Returns:
+        {
+            'changed_pages_count': int,
+            'unchanged_pages_count': int,
+            'total_pages_count': int
+        }
+    """
+    async def _do_count():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute('''
+                SELECT changed, COUNT(*) as count
+                FROM pages WHERE snapshot_id = ?
+                GROUP BY changed
+            ''', (snapshot_id,))
+
+            counts = {'changed_pages_count': 0, 'unchanged_pages_count': 0, 'total_pages_count': 0}
+
+            for row in cursor.fetchall():
+                changed, count = row
+                if changed:
+                    counts['changed_pages_count'] = count
+                else:
+                    counts['unchanged_pages_count'] = count
+                counts['total_pages_count'] += count
+
+            return counts
+
+        except Exception as e:
+            logger.error(f"Fehler beim Berechnen der Change-Counts: {e}")
+            return {'changed_pages_count': 0, 'unchanged_pages_count': 0, 'total_pages_count': 0}
+        finally:
+            conn.close()
+
+    return await _execute_write_with_retry(_do_count)
+
+
+async def persist_page_snapshot(snapshot_id: str, fetch_result: Dict, competitor_id: str,
+                       prev_page_map: Optional[Dict[str, Dict]] = None) -> Dict:
+    """
+    ZENTRALE PAGE-PERSISTENCE FUNKTION MIT GUARDS (REGEL 1) + HASH-GATE
+
+    Speichert eine Page mit allen erforderlichen Komponenten:
+    - raw_html (erforderlich)
+    - normalized_text (erforderlich)
+    - sha256 hash (erforderlich)
+    - extraction_version (erforderlich)
+    - canonical_url (neu)
+    - changed/prev_page_id (neu für Change Detection)
+
+    Args:
+        snapshot_id: ID des neuen Snapshots
+        fetch_result: Fetch-Ergebnis
+        competitor_id: Competitor ID
+        prev_page_map: Optional Map von canonical_url -> prev Page data für Hash-Gate
+
+    Raises:
+        ValueError: Wenn eine erforderliche Komponente fehlt
+    """
+    # REGEL 1 GUARDS: Validierung der erforderlichen Komponenten
+    if not fetch_result.get('html'):
+        raise ValueError("REGEL 1 VERLETZT: raw_html ist erforderlich aber fehlt")
+
+    # Text-Extraktion (wie bisher)
+    title, meta_description, normalized_text = extract_text_from_html(fetch_result['html'])
+
+    if not normalized_text.strip():
+        raise ValueError("REGEL 1 VERLETZT: normalized_text ist erforderlich aber leer")
+
+    # SHA256 Hash berechnen
+    sha256_text = calculate_text_hash(normalized_text)
+    if not sha256_text:
+        raise ValueError("REGEL 1 VERLETZT: sha256 hash konnte nicht berechnet werden")
+
+    # Canonical URL erstellen
+    canonical_url = canonicalize_url(fetch_result.get('final_url', fetch_result['url']))
+
+    # HASH-GATE: Previous Page prüfen
+    changed = True
+    prev_page_id = None
+    reuse_files = False
+
+    if prev_page_map and canonical_url in prev_page_map:
+        prev_page = prev_page_map[canonical_url]
+        prev_sha256 = prev_page.get('sha256_text')
+
+        if prev_sha256 and prev_sha256 == sha256_text:
+            # UNVERÄNDERT: Hash-Gate aktiviert
+            changed = False
+            prev_page_id = prev_page['page_id']
+            reuse_files = True
+            logger.debug(f"Hash-Gate: Page {canonical_url} unverändert (SHA256 gleich)")
+
+    # Extraction Version setzen
+    extraction_version = EXTRACTION_VERSION
+
+    # Guards bestanden - jetzt speichern
+    return await _save_page_with_components(
+        snapshot_id=snapshot_id,
+        fetch_result=fetch_result,
+        competitor_id=competitor_id,
+        normalized_text=normalized_text,
+        sha256_text=sha256_text,
+        extraction_version=extraction_version,
+        title=title,
+        meta_description=meta_description,
+        canonical_url=canonical_url,
+        changed=changed,
+        prev_page_id=prev_page_id,
+        reuse_files=reuse_files,
+        prev_page_data=prev_page_map.get(canonical_url) if prev_page_map and not changed else None
+    )
+
+
+async def _save_page_with_components(snapshot_id: str, fetch_result: Dict, competitor_id: str,
+                                   normalized_text: str, sha256_text: str, extraction_version: str,
+                                   title: str, meta_description: str, canonical_url: str, changed: bool,
+                                   prev_page_id: Optional[str], reuse_files: bool,
+                                   prev_page_data: Optional[Dict]) -> Dict:
+    """
+    Interne Funktion für das tatsächliche Speichern (nach Guards).
     """
     page_id = str(uuid.uuid4())
 
-    # Text-Extraktion
-    title, meta_description, normalized_text = extract_text_from_html(fetch_result['html'])
-    sha256_text = calculate_text_hash(normalized_text)
-
-    # Lokale Dateipfade
+    # Lokale Dateipfade - mit File-Reuse für unveränderte Pages
     snapshot_dir = f"data/snapshots/{snapshot_id}/pages"
     os.makedirs(snapshot_dir, exist_ok=True)
-    html_path = f"{snapshot_id}/pages/{page_id}.html"
-    txt_path = f"{snapshot_id}/pages/{page_id}.txt"
 
-    try:
-        # HTML-Datei lokal speichern
-        html_file_path = f"data/snapshots/{html_path}"
-        with open(html_file_path, 'w', encoding='utf-8') as f:
-            f.write(fetch_result['html'])
+    if reuse_files and prev_page_data:
+        # FILE REUSE: Verwende Pfade der vorherigen Page (Hardlink oder Copy)
+        html_path = prev_page_data.get('raw_path', f"{snapshot_id}/pages/{page_id}.html")
+        txt_path = prev_page_data.get('text_path', f"{snapshot_id}/pages/{page_id}.txt")
 
-        # TXT-Datei lokal speichern
-        txt_file_path = f"data/snapshots/{txt_path}"
-        with open(txt_file_path, 'w', encoding='utf-8') as f:
-            f.write(normalized_text)
+        try:
+            # Erstelle Hardlinks für File-Reuse (effizienter als Kopieren)
+            old_html_path = f"data/snapshots/{html_path}"
+            old_txt_path = f"data/snapshots/{txt_path}"
 
-    except Exception as e:
-        logger.error(f"Fehler beim Speichern der Dateien für Page {page_id}: {e}")
-        return None
+            new_html_path = f"data/snapshots/{snapshot_id}/pages/{page_id}.html"
+            new_txt_path = f"data/snapshots/{snapshot_id}/pages/{page_id}.txt"
+
+            # Hardlink versuchen, bei Fehler kopieren
+            try:
+                os.link(old_html_path, new_html_path)
+                os.link(old_txt_path, new_txt_path)
+                logger.debug(f"File-Reuse: Hardlinks erstellt für {canonical_url}")
+            except OSError:
+                # Fallback: Dateien kopieren
+                import shutil
+                shutil.copy2(old_html_path, new_html_path)
+                shutil.copy2(old_txt_path, new_txt_path)
+                logger.debug(f"File-Reuse: Dateien kopiert für {canonical_url}")
+
+            html_path = f"{snapshot_id}/pages/{page_id}.html"
+            txt_path = f"{snapshot_id}/pages/{page_id}.txt"
+
+        except Exception as e:
+            logger.warning(f"File-Reuse fehlgeschlagen für {canonical_url}, schreibe neue Dateien: {e}")
+            reuse_files = False
+
+    if not reuse_files:
+        # NORMALE FILE-SPEICHERUNG
+        html_path = f"{snapshot_id}/pages/{page_id}.html"
+        txt_path = f"{snapshot_id}/pages/{page_id}.txt"
+
+        try:
+            # HTML-Datei lokal speichern
+            html_file_path = f"data/snapshots/{html_path}"
+            with open(html_file_path, 'w', encoding='utf-8') as f:
+                f.write(fetch_result['html'])
+
+            # TXT-Datei lokal speichern
+            txt_file_path = f"data/snapshots/{txt_path}"
+            with open(txt_file_path, 'w', encoding='utf-8') as f:
+                f.write(normalized_text)
+
+        except Exception as e:
+            logger.error(f"Fehler beim Speichern der Dateien für Page {page_id}: {e}")
+            return None
 
     # Content-Type ermitteln
     content_type = fetch_result.get('headers', {}).get('content-type', 'text/html')
@@ -416,14 +937,15 @@ async def save_page(snapshot_id: str, fetch_result: Dict, competitor_id: str) ->
 
         try:
             cursor.execute('''
-                INSERT INTO pages (id, snapshot_id, url, final_url, status, fetched_at, via, content_type, raw_path, text_path, sha256_text, title, meta_description)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO pages (id, snapshot_id, url, final_url, status, fetched_at, via, content_type, raw_path, text_path, sha256_text, title, meta_description, canonical_url, changed, prev_page_id, normalized_len)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 page_data['id'], page_data['snapshot_id'],
                 page_data['url'], page_data['final_url'], page_data['status'],
                 page_data['fetched_at'], page_data['via'],
                 page_data['content_type'], page_data['html_path'], page_data['txt_path'],
-                page_data['sha256_text'], page_data['title'], page_data['meta_description']
+                page_data['sha256_text'], page_data['title'], page_data['meta_description'],
+                canonical_url, changed, prev_page_id, len(normalized_text)
             ))
 
             conn.commit()
@@ -441,7 +963,10 @@ async def save_page(snapshot_id: str, fetch_result: Dict, competitor_id: str) ->
                 'sha256_text': page_data['sha256_text'],
                 'title': page_data['title'],
                 'meta_description': page_data['meta_description'],
-                'text_path': page_data['txt_path']
+                'text_path': page_data['txt_path'],
+                'canonical_url': canonical_url,
+                'changed': changed,
+                'prev_page_id': prev_page_id
             }
 
         except Exception as e:
@@ -454,6 +979,30 @@ async def save_page(snapshot_id: str, fetch_result: Dict, competitor_id: str) ->
         return await _execute_write_with_retry(_do_save_page)
     except Exception as e:
         logger.error(f"Fehler beim Speichern der Page {page_id} nach Retry: {e}")
+        return None
+
+
+# LEGACY FUNKTION - VERWENDET JETZT persist_page_snapshot()
+async def save_page(snapshot_id: str, fetch_result: Dict, competitor_id: str) -> Dict:
+    """
+    LEGACY WRAPPER - verwendet jetzt persist_page_snapshot() mit Guards
+
+    Args:
+        snapshot_id: ID des Snapshots
+        fetch_result: Dict mit Fetch-Ergebnis
+        competitor_id: ID des Competitors
+
+    Returns:
+        Dict mit Page-Daten für API Response
+    """
+    try:
+        return await persist_page_snapshot(snapshot_id, fetch_result, competitor_id)
+    except ValueError as e:
+        logger.error(f"REGEL 1 GUARD VERLETZT beim Speichern von Page: {e}")
+        # Bei Guard-Verletzung: Snapshot auf failed setzen
+        await update_snapshot_status(snapshot_id, "failed",
+                                   error_code="GUARD_VIOLATION",
+                                   error_message=str(e))
         return None
 
 
@@ -661,6 +1210,25 @@ def get_competitor_socials(competitor_id: str) -> List[Dict]:
         conn.close()
 
 
+async def get_snapshot_page_count(snapshot_id: str) -> int:
+    """Holt die aktuelle Page-Anzahl eines Snapshots"""
+    async def _do_get_count():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute('SELECT COUNT(*) FROM pages WHERE snapshot_id = ?', (snapshot_id,))
+            count = cursor.fetchone()[0]
+            return count
+        except Exception as e:
+            logger.error(f"Fehler beim Zählen der Pages: {e}")
+            return 0
+        finally:
+            conn.close()
+
+    return await _execute_write_with_retry(_do_get_count)
+
+
 def get_snapshot_pages(snapshot_id: str) -> List[Dict]:
     """Holt alle Pages eines Snapshots"""
     conn = sqlite3.connect(DB_PATH)
@@ -669,7 +1237,8 @@ def get_snapshot_pages(snapshot_id: str) -> List[Dict]:
     try:
         cursor.execute('''
             SELECT id, url, final_url, status, fetched_at, via, content_type,
-                   raw_path, text_path, sha256_text, title, meta_description
+                   raw_path, text_path, sha256_text, title, meta_description,
+                   canonical_url, changed, prev_page_id
             FROM pages WHERE snapshot_id = ? ORDER BY fetched_at
         ''', (snapshot_id,))
 
@@ -686,7 +1255,10 @@ def get_snapshot_pages(snapshot_id: str) -> List[Dict]:
                 'text_path': row[8],
                 'sha256_text': row[9],
                 'title': row[10],
-                'meta_description': row[11]
+                'meta_description': row[11],
+                'canonical_url': row[12],
+                'changed': bool(row[13]),
+                'prev_page_id': row[14]
             }
             for row in cursor.fetchall()
         ]

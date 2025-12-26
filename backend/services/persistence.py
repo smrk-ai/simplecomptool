@@ -137,9 +137,9 @@ def extract_text_from_html(html: str) -> Tuple[str, str, str]:
         # Mehrere Leerzeichen/Zeilen zu einem zusammenfassen
         normalized_text = re.sub(r'\s+', ' ', text.strip())
 
-        # Begrenze Länge
-        if len(normalized_text) > MAX_TEXT_LENGTH:
-            normalized_text = normalized_text[:MAX_TEXT_LENGTH]
+        # Optional: Warning bei sehr großen Texten
+        if len(normalized_text) > 200000:
+            logger.warning(f"Very large text extracted: {len(normalized_text)} chars")
 
         return title, meta_description, normalized_text
 

@@ -54,10 +54,8 @@ from services.persistence import (
 store = get_store()
 from services.url_utils import normalize_input_url, validate_url_for_scanning
 
-# Initialize store on startup
-@app.on_event("startup")
-async def initialize_store():
-    await store.init()
+# Background task tracking
+_background_tasks: set = set()
 
 app = FastAPI(title="Simple CompTool Backend", version="1.0.0")
 
@@ -69,6 +67,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Initialize store on startup
+@app.on_event("startup")
+async def initialize_store():
+    await store.init()
+
+@app.on_event("shutdown")
+async def shutdown_background_tasks():
+    """Cancel all background tasks on shutdown"""
+    for task in _background_tasks:
+        task.cancel()
+    if _background_tasks:
+        await asyncio.gather(*_background_tasks, return_exceptions=True)
+    logger.info("Background tasks cancelled")
 
 # Datenbank-Pfad
 DB_PATH = "data/app.db"
@@ -723,13 +735,31 @@ async def scan_endpoint(request: ScanRequest):
 
                 # 10. PHASE B starten (asynchron, kein await!)
                 if rest_urls:
-                    asyncio.create_task(complete_scan_background(
-                        scan_id=scan_id,
-                        snapshot_id=snapshot_id,
-                        rest_urls=rest_urls,
-                        render_mode=render_mode,
-                        competitor_id=competitor_id
-                    ))
+                    task = asyncio.create_task(
+                        complete_scan_background(
+                            scan_id=scan_id,
+                            snapshot_id=snapshot_id,
+                            rest_urls=rest_urls,
+                            render_mode=render_mode,
+                            competitor_id=competitor_id
+                        ),
+                        name=f"scan-{scan_id}-phase-b"
+                    )
+
+                    # Task tracking für cleanup
+                    _background_tasks.add(task)
+                    task.add_done_callback(lambda t: _background_tasks.discard(t))
+
+                    # Exception logging
+                    def _log_task_exception(t):
+                        try:
+                            exc = t.exception()
+                            if exc:
+                                logger.error(f"[{scan_id}] Background task failed: {exc}", exc_info=exc)
+                        except asyncio.CancelledError:
+                            pass
+
+                    task.add_done_callback(_log_task_exception)
                     logger.info(f"[{scan_id}] Phase B im Hintergrund gestartet für {len(rest_urls)} Rest-URLs")
 
                 elapsed_time = time.time() - start_time
@@ -743,7 +773,7 @@ async def scan_endpoint(request: ScanRequest):
                     profile=profile,
                     render_mode=render_mode,
                     snapshot_status="partial",
-                    progress=Progress(done=len(pages_info), total=len(all_urls))
+                    progress=Progress(done=len(pages_info), total=len(final_urls))
                 )
 
         except asyncio.TimeoutError:
@@ -849,7 +879,7 @@ async def get_snapshot_status_endpoint(snapshot_id: str):
             'total_pages_count': len(pages)
         })
 
-    return status_data
+        return status_data
 
     except HTTPException:
         raise

@@ -52,3 +52,11 @@ logs/
 *.tmp
 *.temp
 
+
+# Environment files
+.env
+.env.local
+.env.*.local
+backend/.env
+backend/.env.local
+

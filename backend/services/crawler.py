@@ -8,6 +8,7 @@ from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+from services.browser_manager import browser_manager
 
 # Logging konfigurieren
 logging.basicConfig(level=logging.INFO)
@@ -22,10 +23,6 @@ MAX_CONCURRENT_FETCHES = 5  # Max 5 parallele Fetches
 
 # User-Agent
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-
-# Browser-Pool für Playwright (wiederverwendbar)
-_browser_pool = None
-_playwright_instance = None
 
 # Playwright-Usage Counter (für Logging)
 _playwright_usage_count = 0
@@ -249,21 +246,6 @@ async def fetch_with_httpx(url: str) -> Dict:
             await asyncio.sleep(1 * (attempt + 1))  # Exponential backoff
 
 
-async def get_browser_pool():
-    """
-    Wiederverwendbarer Browser-Pool für Playwright
-    Vermeidet wiederholtes Browser-Startup
-    """
-    global _browser_pool, _playwright_instance
-    
-    if _browser_pool is None:
-        _playwright_instance = await async_playwright().start()
-        _browser_pool = await _playwright_instance.chromium.launch(headless=True)
-        logger.info("Playwright Browser-Pool initialisiert")
-    
-    return _browser_pool
-
-
 async def fetch_with_playwright(url: str) -> Dict:
     """
     Fetcht eine URL mit Playwright (für JS-required Seiten)
@@ -271,35 +253,35 @@ async def fetch_with_playwright(url: str) -> Dict:
     """
     global _playwright_usage_count
     _playwright_usage_count += 1
-    
-    browser = await get_browser_pool()
-    context = await browser.new_context(
-        user_agent=USER_AGENT
-    )
-    page = await context.new_page()
 
-    try:
-        # Schnelleres Wait-Strategy: domcontentloaded statt networkidle
-        # Timeout basierend auf READ_TIMEOUT
-        await page.goto(url, wait_until="domcontentloaded", timeout=int(READ_TIMEOUT * 1000))
-        await page.wait_for_timeout(500)  # Reduziert von 2000ms auf 500ms
+    async with browser_manager.get_browser() as browser:
+        context = await browser.new_context(
+            user_agent=USER_AGENT
+        )
+        page = await context.new_page()
+        try:
+            # Schnelleres Wait-Strategy: domcontentloaded statt networkidle
+            # Timeout basierend auf READ_TIMEOUT
+            await page.goto(url, wait_until="domcontentloaded", timeout=int(READ_TIMEOUT * 1000))
+            await page.wait_for_timeout(500)  # Reduziert von 2000ms auf 500ms
 
-        content = await page.content()
+            content = await page.content()
 
-        return {
-            'final_url': page.url,
-            'status': 200,  # Playwright gibt keinen HTTP-Status zurück
-            'headers': {},  # Playwright gibt keine Headers zurück
-            'html': content,
-            'fetched_at': datetime.now().isoformat(),
-            'via': 'playwright'
-        }
+            return {
+                'final_url': page.url,
+                'status': 200,  # Playwright gibt keinen HTTP-Status zurück
+                'headers': {},  # Playwright gibt keine Headers zurück
+                'html': content,
+                'fetched_at': datetime.now().isoformat(),
+                'via': 'playwright'
+            }
 
-    except Exception as e:
-        logger.error(f"Playwright fetch fehlgeschlagen für {url}: {e}")
-        raise
-    finally:
-        await context.close()
+        except Exception as e:
+            logger.error(f"Playwright fetch fehlgeschlagen für {url}: {e}")
+            raise
+        finally:
+            await page.close()
+            await context.close()
 
 
 def get_playwright_usage_count() -> int:

@@ -508,18 +508,7 @@ async def create_profile_with_llm(competitor_id: str, snapshot_id: str, pages: L
         profile_text = response.choices[0].message.content.strip()
 
         # Speichere Profil in Datenbank
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-
-        data = {
-            'id': str(uuid.uuid4()),
-            'competitor_id': competitor_id,
-            'snapshot_id': snapshot_id,
-            'created_at': datetime.now().isoformat(),
-            'text': profile_text
-        }
-
-        supabase.table('profiles').insert(data).execute()
+        save_profile_to_db(competitor_id, snapshot_id, profile_text)
 
         logger.info(f"Profil für Competitor {competitor_id} erstellt und gespeichert")
         return profile_text
@@ -527,6 +516,23 @@ async def create_profile_with_llm(competitor_id: str, snapshot_id: str, pages: L
     except Exception as e:
         logger.error(f"Fehler bei LLM-Profil-Erstellung: {e}")
         return None
+
+
+def save_profile_to_db(competitor_id: str, snapshot_id: str, profile_text: str) -> dict:
+    """Speichert Profil direkt in Supabase"""
+    from datetime import datetime
+
+    result = supabase.table("profiles").insert({
+        "competitor_id": competitor_id,
+        "snapshot_id": snapshot_id,
+        "text": profile_text,
+        "created_at": datetime.now().isoformat()
+    }).execute()
+
+    if not result.data:
+        raise Exception("Profile save failed")
+
+    return result.data[0]
 
 
 def get_competitor_profile(competitor_id: str, snapshot_id: Optional[str] = None) -> Optional[Dict]:

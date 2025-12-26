@@ -396,84 +396,58 @@ def get_snapshot_endpoint(snapshot_id: str):
     return snapshot
 
 @app.get("/api/pages/{page_id}/raw")
-async def download_page_raw(page_id: str):
-    """HTML-Datei als Download bereitstellen"""
-    from services.persistence import supabase
-
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase-Verbindung nicht verfügbar")
-
+async def download_raw(page_id: str):
+    """Download raw HTML"""
     try:
-        # Page-Daten laden
-        page_result = supabase.table('pages').select('raw_path, url').eq('id', page_id).execute()
+        supabase = _ensure_supabase()
 
+        page_result = supabase.table("pages")\
+            .select("raw_path")\
+            .eq("id", page_id)\
+            .single()\
+            .execute()
+        
         if not page_result.data:
-            raise HTTPException(status_code=404, detail="Page nicht gefunden")
-
-        page = page_result.data[0]
-        raw_path = page['raw_path']
-
-        # HTML-Datei aus Supabase Storage laden
-        response = supabase.storage.from_('html-files').download(raw_path)
-        html_content = response.decode('utf-8')
-
-        # Als Download zurückgeben
-        filename = f"{page_id}.html"
-        return Response(
-            content=html_content,
-            media_type="text/html",
-            headers={
-                "Content-Disposition": f"attachment; filename={filename}",
-                "Content-Type": "text/html; charset=utf-8"
-            }
-        )
-
+            raise HTTPException(status_code=404, detail="Page not found")
+        
+        raw_path = page_result.data.get('raw_path')
+        
+        if not raw_path:
+            raise HTTPException(status_code=404, detail="Raw HTML not available")
+        
+        file_data = supabase.storage.from_("snapshots").download(raw_path)
+        return Response(content=file_data, media_type="text/html; charset=utf-8")
+        
     except Exception as e:
-        logger.error(f"Fehler beim Laden der HTML-Datei für Page {page_id}: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"HTML-Datei konnte nicht geladen werden: {str(e)}"
-        )
+        logger.error(f"Download raw failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/pages/{page_id}/text")
-async def download_page_text(page_id: str):
-    """TXT-Datei als Download bereitstellen"""
-    from services.persistence import supabase
-
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase-Verbindung nicht verfügbar")
-
+async def download_text(page_id: str):
+    """Download extracted text"""
     try:
-        # Page-Daten laden
-        page_result = supabase.table('pages').select('text_path, url').eq('id', page_id).execute()
+        supabase = _ensure_supabase()
 
+        page_result = supabase.table("pages")\
+            .select("text_path")\
+            .eq("id", page_id)\
+            .single()\
+            .execute()
+        
         if not page_result.data:
-            raise HTTPException(status_code=404, detail="Page nicht gefunden")
-
-        page = page_result.data[0]
-        text_path = page['text_path']
-
-        # TXT-Datei aus Supabase Storage laden
-        response = supabase.storage.from_('txt-files').download(text_path)
-        text_content = response.decode('utf-8')
-
-        # Als Download zurückgeben
-        filename = f"{page_id}.txt"
-        return Response(
-            content=text_content,
-            media_type="text/plain",
-            headers={
-                "Content-Disposition": f"attachment; filename={filename}",
-                "Content-Type": "text/plain; charset=utf-8"
-            }
-        )
-
+            raise HTTPException(status_code=404, detail="Page not found")
+        
+        text_path = page_result.data.get('text_path')
+        
+        if not text_path:
+            raise HTTPException(status_code=404, detail="Text not available")
+        
+        file_data = supabase.storage.from_("snapshots").download(text_path)
+        return Response(content=file_data, media_type="text/plain; charset=utf-8")
+        
     except Exception as e:
-        logger.error(f"Fehler beim Laden der TXT-Datei für Page {page_id}: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"TXT-Datei konnte nicht geladen werden: {str(e)}"
-        )
+        logger.error(f"Download text failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Startup Event
 @app.on_event("startup")

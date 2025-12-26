@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 
 // API-Base-URL aus Environment-Variable
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
@@ -76,6 +76,8 @@ export default function Home() {
   const [isPolling, setIsPolling] = useState(false);
   const [currentProgress, setCurrentProgress] = useState<{ done: number; total: number } | null>(null);
 
+  const abortControllerRef = useRef<AbortController | null>(null);
+
   // Lade alle Competitors beim ersten Laden
   useEffect(() => {
     loadCompetitors();
@@ -123,7 +125,14 @@ export default function Home() {
         clearInterval(intervalId);
       }
     };
-  }, [isPolling, scanResult?.snapshot_id]);
+  }, [isPolling, scanResult?.snapshot_id, loadSnapshotDetails]);
+
+  // Cleanup bei Unmount
+  useEffect(() => {
+    return () => {
+      abortControllerRef.current?.abort();
+    };
+  }, []);
 
   const loadCompetitors = async () => {
     try {
@@ -141,6 +150,11 @@ export default function Home() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    // Vorherigen Request abbrechen falls noch laufend
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = new AbortController();
+
     setIsLoading(true);
     setError('');
     setScanResult(null);
@@ -161,6 +175,7 @@ export default function Home() {
           url: url.trim(), // URL wird im Backend normalisiert
           llm: false, // Für jetzt ohne LLM
         }),
+        signal: abortControllerRef.current.signal,
       });
 
       const result: ScanResult = await response.json();
@@ -192,13 +207,17 @@ export default function Home() {
       // Competitors neu laden
       await loadCompetitors();
     } catch (err) {
+      // Ignoriere Abbruch-Fehler
+      if (err instanceof Error && err.name === 'AbortError') {
+        return;
+      }
       setError(err instanceof Error ? err.message : 'Unbekannter Fehler');
     } finally {
       setIsLoading(false);
     }
   };
 
-  const loadSnapshotDetails = async (snapshotId: string) => {
+  const loadSnapshotDetails = useCallback(async (snapshotId: string) => {
     try {
       const response = await fetch(`${API_BASE_URL}/api/snapshots/${snapshotId}`);
       if (response.ok) {
@@ -210,7 +229,7 @@ export default function Home() {
     } catch (err) {
       console.error('Fehler beim Laden der Snapshot-Details:', err);
     }
-  };
+  }, []);
 
   const formatDate = (dateString: string) => {
     return new Date(dateString).toLocaleString('de-DE');

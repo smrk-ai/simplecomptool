@@ -1041,6 +1041,44 @@ async def get_page_preview(page_id: str):
 #         from services.persistence import init_db
 #         init_db()
 
+@app.get("/health")
+async def health_check():
+    """Basic health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "version": "1.0.0"
+    }
+
+
+@app.get("/health/ready")
+async def readiness_check():
+    """Readiness check - verifies all dependencies are ready"""
+    checks = {
+        "database": False,
+    }
+
+    # Database Check
+    try:
+        # Versuche eine einfache DB-Operation
+        await store.get_competitors()
+        checks["database"] = True
+    except Exception as e:
+        logger.error(f"Database health check failed: {e}")
+
+    all_healthy = all(checks.values())
+    status_code = 200 if all_healthy else 503
+
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "ready" if all_healthy else "not_ready",
+            "checks": checks,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

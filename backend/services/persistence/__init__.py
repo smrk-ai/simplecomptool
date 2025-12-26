@@ -5,7 +5,16 @@ Persistence Services Package
 from .base import Store
 from .store_factory import get_store
 from .sqlite_store import SQLiteStore
-from .supabase_store import SupabaseStore
+
+# Optional: SupabaseStore nur importieren wenn Supabase verfügbar ist
+try:
+    from .supabase_store import SupabaseStore
+    _HAS_SUPABASE = True
+except ImportError:
+    _HAS_SUPABASE = False
+    # Dummy class für Typ-Hints
+    SupabaseStore = None  # type: ignore
+
 import re
 import logging
 import hashlib

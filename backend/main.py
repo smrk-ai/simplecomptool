@@ -620,7 +620,7 @@ async def extract_social_links_from_snapshot(snapshot_id: str, competitor_id: st
 # API Endpoints
 @app.post("/api/scan", response_model=ScanResponse)
 @limiter.limit("10/minute")
-async def scan_endpoint(request: ScanRequest, http_request: Request):
+async def scan_endpoint(scan_request: ScanRequest, request: Request):
     """
     Vollständiger Website-Scan mit Crawling und Persistenz
     Optional: LLM-basierte Profil-Erstellung
@@ -637,11 +637,11 @@ async def scan_endpoint(request: ScanRequest, http_request: Request):
 
     # URL normalisieren und validieren
     try:
-        normalized_url = normalize_input_url(request.url)
+        normalized_url = normalize_input_url(scan_request.url)
         validate_url_for_scanning(normalized_url)
-        logger.info(f"[{scan_id}] URL normalisiert: {request.url} -> {normalized_url}")
+        logger.info(f"[{scan_id}] URL normalisiert: {scan_request.url} -> {normalized_url}")
     except ValueError as e:
-        logger.warning(f"[{scan_id}] Ungültige URL: {request.url} - {str(e)}")
+        logger.warning(f"[{scan_id}] Ungültige URL: {scan_request.url} - {str(e)}")
         return ScanResponse(
             ok=False,
             error=ErrorDetail(code="INVALID_URL", message=str(e))
@@ -660,7 +660,7 @@ async def scan_endpoint(request: ScanRequest, http_request: Request):
 
         try:
             # 1. Competitor finden oder erstellen (upsert by base_url)
-            competitor_id = await store.upsert_competitor(request.name, normalized_url)
+            competitor_id = await store.upsert_competitor(scan_request.name, normalized_url)
             logger.info(f"[{scan_id}] Competitor ID: {competitor_id}")
 
             # 2. URLs entdecken
@@ -765,7 +765,7 @@ async def scan_endpoint(request: ScanRequest, http_request: Request):
                 logger.info(f"[{scan_id}] Phase A abgeschlossen: {len(pages_info)} Seiten gespeichert")
 
                 # 8. Optional: LLM-Profil erstellen (Priorität auf changed pages)
-                if request.llm and pages_data:
+                if scan_request.llm and pages_data:
                     try:
                         logger.info(f"[{scan_id}] Erstelle LLM-Profil...")
 

@@ -10,7 +10,14 @@ from typing import Optional
 
 from .base import Store
 from .sqlite_store import SQLiteStore
-from .supabase_store import SupabaseStore
+
+# Supabase ist optional - nur importieren wenn verfügbar
+try:
+    from .supabase_store import SupabaseStore
+    _HAS_SUPABASE = True
+except ImportError:
+    _HAS_SUPABASE = False
+    SupabaseStore = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +36,12 @@ def get_store() -> Store:
         store = SQLiteStore()
 
     elif backend == "supabase":
+        if not _HAS_SUPABASE:
+            raise ImportError(
+                "Supabase backend requested but supabase module is not installed. "
+                "Install it with: pip install supabase>=2.10.0"
+            )
+
         logger.info("Using Supabase persistence backend")
 
         supabase_url = os.getenv("SUPABASE_URL")
@@ -40,7 +53,7 @@ def get_store() -> Store:
                 "Supabase backend requires SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables"
             )
 
-        store = SupabaseStore(
+        store = SupabaseStore(  # type: ignore
             supabase_url=supabase_url,
             supabase_key=supabase_key,
             storage_bucket=storage_bucket

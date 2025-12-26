@@ -12,12 +12,42 @@ import os
 import sqlite3
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Any
 from urllib.parse import urlparse
 
 from .base import Store
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_id(id_value: str, name: str = "ID") -> str:
+    """Validiert dass eine ID nur sichere Zeichen enthält (UUID-Format)"""
+    if not id_value:
+        raise ValueError(f"{name} darf nicht leer sein")
+
+    # Nur alphanumerisch und Bindestriche erlauben (UUID-Format)
+    import re
+    if not re.match(r'^[a-zA-Z0-9-]+$', id_value):
+        raise ValueError(f"Ungültiges {name}-Format: nur alphanumerische Zeichen und Bindestriche erlaubt")
+
+    # Maximale Länge (UUID = 36 Zeichen)
+    if len(id_value) > 50:
+        raise ValueError(f"{name} zu lang")
+
+    return id_value
+
+
+def _safe_path(base: str, *parts: str) -> Path:
+    """Erstellt einen sicheren Pfad und prüft auf Path-Traversal"""
+    base_path = Path(base).resolve()
+    full_path = base_path.joinpath(*parts).resolve()
+
+    # Sicherstellen, dass der Pfad innerhalb von base_path bleibt
+    if not str(full_path).startswith(str(base_path)):
+        raise ValueError("Ungültiger Pfad: Path-Traversal erkannt")
+
+    return full_path
 
 
 class SQLiteStore(Store):
@@ -283,6 +313,8 @@ class SQLiteStore(Store):
 
     async def insert_or_update_page(self, snapshot_id: str, page_payload: Dict[str, Any]) -> str:
         """Insert or update a page."""
+        # ID-Validierung für Path-Traversal-Schutz
+        snapshot_id = _validate_id(snapshot_id, "Snapshot-ID")
         page_id = str(uuid.uuid4())
 
         async def _do_insert():
@@ -404,6 +436,9 @@ class SQLiteStore(Store):
 
     async def get_pages_map(self, snapshot_id: str) -> Dict[str, Dict[str, Any]]:
         """Get a map of canonical_url -> page data for change detection."""
+        # ID-Validierung für Path-Traversal-Schutz
+        snapshot_id = _validate_id(snapshot_id, "Snapshot-ID")
+
         async def _do_get():
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -437,6 +472,9 @@ class SQLiteStore(Store):
     async def get_snapshot(self, snapshot_id: str, with_previews: bool = False,
                           preview_limit: int = 10) -> Optional[Dict[str, Any]]:
         """Get complete snapshot data including pages."""
+        # ID-Validierung für Path-Traversal-Schutz
+        snapshot_id = _validate_id(snapshot_id, "Snapshot-ID")
+
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
@@ -509,7 +547,8 @@ class SQLiteStore(Store):
                 if with_previews and len(pages) < preview_limit:
                     try:
                         if page.get('text_path'):
-                            text_file_path = f"data/snapshots/{page['text_path']}"
+                            # Path-Traversal-Schutz mit _safe_path
+                            text_file_path = _safe_path("data/snapshots", page['text_path'])
                             with open(text_file_path, 'r', encoding='utf-8') as f:
                                 text_content = f.read()
                             page['text_preview'] = text_content[:300]
@@ -646,6 +685,9 @@ class SQLiteStore(Store):
 
     async def download_page_raw(self, page_id: str) -> Optional[bytes]:
         """Download raw HTML content for a page."""
+        # ID-Validierung für Path-Traversal-Schutz
+        page_id = _validate_id(page_id, "Page-ID")
+
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
@@ -659,8 +701,8 @@ class SQLiteStore(Store):
 
             raw_path = row[0]
 
-            # HTML-Datei aus lokalem Storage laden
-            html_file_path = f"data/snapshots/{raw_path}"
+            # HTML-Datei aus lokalem Storage laden (mit Path-Traversal-Schutz)
+            html_file_path = _safe_path("data/snapshots", raw_path)
             with open(html_file_path, 'rb') as f:
                 return f.read()
 
@@ -672,6 +714,9 @@ class SQLiteStore(Store):
 
     async def download_page_text(self, page_id: str) -> Optional[bytes]:
         """Download normalized text content for a page."""
+        # ID-Validierung für Path-Traversal-Schutz
+        page_id = _validate_id(page_id, "Page-ID")
+
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
@@ -685,8 +730,8 @@ class SQLiteStore(Store):
 
             text_path = row[0]
 
-            # TXT-Datei aus lokalem Storage laden
-            text_file_path = f"data/snapshots/{text_path}"
+            # TXT-Datei aus lokalem Storage laden (mit Path-Traversal-Schutz)
+            text_file_path = _safe_path("data/snapshots", text_path)
             with open(text_file_path, 'rb') as f:
                 return f.read()
 
@@ -698,6 +743,9 @@ class SQLiteStore(Store):
 
     async def get_page_preview(self, page_id: str, max_length: int = 300) -> Optional[Dict[str, Any]]:
         """Get text preview for a page."""
+        # ID-Validierung für Path-Traversal-Schutz
+        page_id = _validate_id(page_id, "Page-ID")
+
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
@@ -711,8 +759,8 @@ class SQLiteStore(Store):
 
             text_path = row[0]
 
-            # Text-Preview aus lokaler Datei laden
-            text_file_path = f"data/snapshots/{text_path}"
+            # Text-Preview aus lokaler Datei laden (mit Path-Traversal-Schutz)
+            text_file_path = _safe_path("data/snapshots", text_path)
             with open(text_file_path, 'r', encoding='utf-8') as f:
                 text_content = f.read()
 

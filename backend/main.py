@@ -4,6 +4,9 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import Optional, List
 import os
+import re
+import ipaddress
+from pydantic import Field, validator
 from datetime import datetime
 import asyncio
 import uuid
@@ -96,9 +99,51 @@ class Progress(BaseModel):
     total: int
 
 class ScanRequest(BaseModel):
-    name: Optional[str] = None
-    url: str
+    name: Optional[str] = Field(None, max_length=255)
+    url: str = Field(..., min_length=1, max_length=2048)
     llm: bool = False
+
+    @validator('url')
+    def validate_url(cls, v):
+        v = v.strip()
+
+        # Längenprüfung
+        if len(v) > 2048:
+            raise ValueError('URL zu lang (max 2048 Zeichen)')
+
+        if len(v) < 4:
+            raise ValueError('URL zu kurz')
+
+        # Wenn kein Schema, füge https:// hinzu für Validierung
+        test_url = v if v.startswith(('http://', 'https://')) else f'https://{v}'
+
+        # Grundlegende URL-Pattern-Prüfung
+        url_pattern = re.compile(
+            r'^https?://'
+            r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,63}\.?|'
+            r'localhost|'
+            r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
+            r'(?::\d+)?'
+            r'(?:/?|[/?]\S*)?$', re.IGNORECASE
+        )
+
+        if not url_pattern.match(test_url):
+            raise ValueError('Ungültiges URL-Format')
+
+        # SSRF-Schutz: Private IPs blocken
+        from urllib.parse import urlparse
+        parsed = urlparse(test_url)
+        hostname = parsed.hostname
+
+        if hostname:
+            try:
+                ip = ipaddress.ip_address(hostname)
+                if ip.is_private or ip.is_loopback or ip.is_reserved:
+                    raise ValueError('Private/lokale IP-Adressen sind nicht erlaubt')
+            except ValueError:
+                pass  # Hostname ist kein IP - das ist OK
+
+        return v
 
 class PageInfo(BaseModel):
     id: str

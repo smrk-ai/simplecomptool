@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import sqlite3
+import aiosqlite
 import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -12,8 +13,6 @@ from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 import openai
 import asyncio
-import hashlib
-import json
 
 from .url_utils import normalize_input_url
 
@@ -190,7 +189,7 @@ async def _execute_write_with_retry(operation_func, *args, max_retries=3):
         for attempt in range(max_retries):
             try:
                 return await operation_func(*args)
-            except sqlite3.OperationalError as e:
+            except (sqlite3.OperationalError, aiosqlite.OperationalError) as e:
                 if "database is locked" in str(e).lower():
                     if attempt < max_retries - 1:
                         wait_time = 1 * (2 ** attempt)  # Exponential backoff
@@ -590,33 +589,29 @@ async def check_page_set_changed(competitor_id: str, new_page_set_hash: str) -> 
         True wenn sich das Page-Set geändert hat, False sonst
     """
     async def _do_check():
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+        async with aiosqlite.connect(DB_PATH) as conn:
+            try:
+                # Hole den neuesten erfolgreichen Snapshot für diesen Competitor
+                cursor = await conn.execute('''
+                    SELECT page_set_hash FROM snapshots
+                    WHERE competitor_id = ? AND status = 'done' AND page_set_hash IS NOT NULL
+                    ORDER BY created_at DESC LIMIT 1
+                ''', (competitor_id,))
 
-        try:
-            # Hole den neuesten erfolgreichen Snapshot für diesen Competitor
-            cursor.execute('''
-                SELECT page_set_hash FROM snapshots
-                WHERE competitor_id = ? AND status = 'done' AND page_set_hash IS NOT NULL
-                ORDER BY created_at DESC LIMIT 1
-            ''', (competitor_id,))
+                row = await cursor.fetchone()
+                if row and row[0]:
+                    last_hash = row[0]
+                    changed = last_hash != new_page_set_hash
+                    if changed:
+                        logger.info(f"Page-Set geändert für Competitor {competitor_id}: {last_hash[:16]}... -> {new_page_set_hash[:16]}...")
+                    return changed
+                else:
+                    # Erster Snapshot - keine Änderung
+                    return False
 
-            row = cursor.fetchone()
-            if row and row[0]:
-                last_hash = row[0]
-                changed = last_hash != new_page_set_hash
-                if changed:
-                    logger.info(f"Page-Set geändert für Competitor {competitor_id}: {last_hash[:16]}... -> {new_page_set_hash[:16]}...")
-                return changed
-            else:
-                # Erster Snapshot - keine Änderung
+            except Exception as e:
+                logger.error(f"Fehler bei Page-Set Vergleich: {e}")
                 return False
-
-        except Exception as e:
-            logger.error(f"Fehler bei Page-Set Vergleich: {e}")
-            return False
-        finally:
-            conn.close()
 
     return await _execute_write_with_retry(_do_check)
 
@@ -737,33 +732,30 @@ async def get_snapshot_change_counts(snapshot_id: str) -> Dict[str, int]:
         }
     """
     async def _do_count():
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+        async with aiosqlite.connect(DB_PATH) as conn:
+            try:
+                cursor = await conn.execute('''
+                    SELECT changed, COUNT(*) as count
+                    FROM pages WHERE snapshot_id = ?
+                    GROUP BY changed
+                ''', (snapshot_id,))
 
-        try:
-            cursor.execute('''
-                SELECT changed, COUNT(*) as count
-                FROM pages WHERE snapshot_id = ?
-                GROUP BY changed
-            ''', (snapshot_id,))
+                counts = {'changed_pages_count': 0, 'unchanged_pages_count': 0, 'total_pages_count': 0}
 
-            counts = {'changed_pages_count': 0, 'unchanged_pages_count': 0, 'total_pages_count': 0}
+                rows = await cursor.fetchall()
+                for row in rows:
+                    changed, count = row
+                    if changed:
+                        counts['changed_pages_count'] = count
+                    else:
+                        counts['unchanged_pages_count'] = count
+                    counts['total_pages_count'] += count
 
-            for row in cursor.fetchall():
-                changed, count = row
-                if changed:
-                    counts['changed_pages_count'] = count
-                else:
-                    counts['unchanged_pages_count'] = count
-                counts['total_pages_count'] += count
+                return counts
 
-            return counts
-
-        except Exception as e:
-            logger.error(f"Fehler beim Berechnen der Change-Counts: {e}")
-            return {'changed_pages_count': 0, 'unchanged_pages_count': 0, 'total_pages_count': 0}
-        finally:
-            conn.close()
+            except Exception as e:
+                logger.error(f"Fehler beim Berechnen der Change-Counts: {e}")
+                return {'changed_pages_count': 0, 'unchanged_pages_count': 0, 'total_pages_count': 0}
 
     return await _execute_write_with_retry(_do_count)
 
@@ -1047,25 +1039,22 @@ async def update_snapshot_page_count(snapshot_id: str):
     """Aktualisiert die page_count eines Snapshots"""
 
     async def _do_update_page_count():
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+        async with aiosqlite.connect(DB_PATH) as conn:
+            try:
+                # Zähle Pages für diesen Snapshot
+                cursor = await conn.execute('SELECT COUNT(*) FROM pages WHERE snapshot_id = ?', (snapshot_id,))
+                row = await cursor.fetchone()
+                count = row[0]
 
-        try:
-            # Zähle Pages für diesen Snapshot
-            cursor.execute('SELECT COUNT(*) FROM pages WHERE snapshot_id = ?', (snapshot_id,))
-            count = cursor.fetchone()[0]
+                # Aktualisiere Snapshot
+                await conn.execute('UPDATE snapshots SET page_count = ? WHERE id = ?', (count, snapshot_id))
+                await conn.commit()
 
-            # Aktualisiere Snapshot
-            cursor.execute('UPDATE snapshots SET page_count = ? WHERE id = ?', (count, snapshot_id))
-            conn.commit()
+                logger.debug(f"Snapshot {snapshot_id} page_count auf {count} aktualisiert")
 
-            logger.debug(f"Snapshot {snapshot_id} page_count auf {count} aktualisiert")
-
-        except Exception as e:
-            logger.error(f"Fehler beim Aktualisieren der page_count: {e}")
-            raise
-        finally:
-            conn.close()
+            except Exception as e:
+                logger.error(f"Fehler beim Aktualisieren der page_count: {e}")
+                raise
 
     await _execute_write_with_retry(_do_update_page_count)
 
@@ -1081,32 +1070,28 @@ async def update_snapshot_status(snapshot_id: str, status: str, **kwargs):
     """
 
     async def _do_update_status():
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+        async with aiosqlite.connect(DB_PATH) as conn:
+            try:
+                # Erstelle Update-Query dynamisch
+                update_fields = ['status = ?']
+                values = [status]
 
-        try:
-            # Erstelle Update-Query dynamisch
-            update_fields = ['status = ?']
-            values = [status]
+                allowed_fields = ['progress_pages_done', 'progress_pages_total', 'finished_at', 'error_code', 'error_message']
+                for key, value in kwargs.items():
+                    if key in allowed_fields:
+                        update_fields.append(f'{key} = ?')
+                        values.append(value)
 
-            allowed_fields = ['progress_pages_done', 'progress_pages_total', 'finished_at', 'error_code', 'error_message']
-            for key, value in kwargs.items():
-                if key in allowed_fields:
-                    update_fields.append(f'{key} = ?')
-                    values.append(value)
+                values.append(snapshot_id)  # Für WHERE clause
 
-            values.append(snapshot_id)  # Für WHERE clause
+                query = f"UPDATE snapshots SET {', '.join(update_fields)} WHERE id = ?"
+                await conn.execute(query, values)
+                await conn.commit()
 
-            query = f"UPDATE snapshots SET {', '.join(update_fields)} WHERE id = ?"
-            cursor.execute(query, values)
-            conn.commit()
-
-            logger.debug(f"Snapshot {snapshot_id} Status aktualisiert: {status}")
-        except Exception as e:
-            logger.error(f"Fehler beim Aktualisieren des Snapshot-Status: {e}")
-            raise
-        finally:
-            conn.close()
+                logger.debug(f"Snapshot {snapshot_id} Status aktualisiert: {status}")
+            except Exception as e:
+                logger.error(f"Fehler beim Aktualisieren des Snapshot-Status: {e}")
+                raise
 
     await _execute_write_with_retry(_do_update_status)
 
@@ -1161,23 +1146,19 @@ async def increment_snapshot_progress(snapshot_id: str):
     """Erhöht progress_pages_done um 1"""
 
     async def _do_increment_progress():
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+        async with aiosqlite.connect(DB_PATH) as conn:
+            try:
+                # Erhöhe progress_pages_done um 1
+                await conn.execute('''
+                    UPDATE snapshots SET progress_pages_done = progress_pages_done + 1 WHERE id = ?
+                ''', (snapshot_id,))
+                await conn.commit()
 
-        try:
-            # Erhöhe progress_pages_done um 1
-            cursor.execute('''
-                UPDATE snapshots SET progress_pages_done = progress_pages_done + 1 WHERE id = ?
-            ''', (snapshot_id,))
-            conn.commit()
+                logger.debug(f"Snapshot {snapshot_id} progress erhöht")
 
-            logger.debug(f"Snapshot {snapshot_id} progress erhöht")
-
-        except Exception as e:
-            logger.error(f"Fehler beim Inkrementieren des Progress: {e}")
-            raise
-        finally:
-            conn.close()
+            except Exception as e:
+                logger.error(f"Fehler beim Inkrementieren des Progress: {e}")
+                raise
 
     await _execute_write_with_retry(_do_increment_progress)
 
@@ -1213,18 +1194,15 @@ def get_competitor_socials(competitor_id: str) -> List[Dict]:
 async def get_snapshot_page_count(snapshot_id: str) -> int:
     """Holt die aktuelle Page-Anzahl eines Snapshots"""
     async def _do_get_count():
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-
-        try:
-            cursor.execute('SELECT COUNT(*) FROM pages WHERE snapshot_id = ?', (snapshot_id,))
-            count = cursor.fetchone()[0]
-            return count
-        except Exception as e:
-            logger.error(f"Fehler beim Zählen der Pages: {e}")
-            return 0
-        finally:
-            conn.close()
+        async with aiosqlite.connect(DB_PATH) as conn:
+            try:
+                cursor = await conn.execute('SELECT COUNT(*) FROM pages WHERE snapshot_id = ?', (snapshot_id,))
+                row = await cursor.fetchone()
+                count = row[0]
+                return count
+            except Exception as e:
+                logger.error(f"Fehler beim Zählen der Pages: {e}")
+                return 0
 
     return await _execute_write_with_retry(_do_get_count)
 
@@ -1393,7 +1371,7 @@ async def create_profile_with_llm(competitor_id: str, snapshot_id: str, pages: L
         # Stelle sicher, dass die Verbindung geschlossen wird
         try:
             conn.close()
-        except:
+        except Exception:
             pass
 
 

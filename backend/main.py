@@ -1,8 +1,8 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict
 import os
 import re
 import ipaddress
@@ -13,6 +13,9 @@ import uuid
 import time
 import logging
 from dotenv import load_dotenv
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Environment Variables laden
 import pathlib
@@ -26,6 +29,12 @@ except Exception:
 
 # CORS-Konfiguration aus Environment-Variable
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+
+# CORS-Validierung: allow_credentials=True ist nicht mit allow_origins=["*"] kompatibel
+if "*" in CORS_ORIGINS:
+    ALLOW_CREDENTIALS = False
+else:
+    ALLOW_CREDENTIALS = True
 
 # Persistence Backend Konfiguration
 PERSISTENCE_BACKEND = os.getenv("PERSISTENCE_BACKEND", "sqlite").lower()
@@ -51,7 +60,16 @@ from services.persistence import (
     extract_text_from_html,
     calculate_text_hash,
     canonicalize_url,
-    EXTRACTION_VERSION
+    EXTRACTION_VERSION,
+    PAGE_SET_VERSION,
+    get_store,
+    create_deterministic_page_set,
+    update_snapshot_status,
+    increment_snapshot_progress,
+    get_snapshot_page_count,
+    check_page_set_changed,
+    get_snapshot_change_counts,
+    update_snapshot_page_count
 )
 # Initialize the persistence store
 store = get_store()
@@ -60,13 +78,20 @@ from services.url_utils import normalize_input_url, validate_url_for_scanning
 # Background task tracking
 _background_tasks: set = set()
 
+# Rate Limiter initialisieren
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI(title="Simple CompTool Backend", version="1.0.0")
+
+# Rate Limiter zu App hinzufügen
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS für Frontend-Zugriff
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,  # Konfigurierbar über CORS_ORIGINS Environment-Variable
-    allow_credentials=True,
+    allow_credentials=ALLOW_CREDENTIALS,  # Automatisch False wenn CORS_ORIGINS="*"
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -594,7 +619,8 @@ async def extract_social_links_from_snapshot(snapshot_id: str, competitor_id: st
 
 # API Endpoints
 @app.post("/api/scan", response_model=ScanResponse)
-async def scan_endpoint(request: ScanRequest):
+@limiter.limit("10/minute")
+async def scan_endpoint(request: ScanRequest, http_request: Request):
     """
     Vollständiger Website-Scan mit Crawling und Persistenz
     Optional: LLM-basierte Profil-Erstellung
@@ -944,9 +970,9 @@ async def get_snapshot_endpoint(snapshot_id: str, with_previews: bool = False, p
     """
     try:
         snapshot = await store.get_snapshot(snapshot_id, with_previews=with_previews, preview_limit=preview_limit)
-    if not snapshot:
-        raise HTTPException(status_code=404, detail="Snapshot nicht gefunden")
-    return snapshot
+        if not snapshot:
+            raise HTTPException(status_code=404, detail="Snapshot nicht gefunden")
+        return snapshot
     except HTTPException:
         raise
     except Exception as e:
@@ -1061,7 +1087,7 @@ async def readiness_check():
     # Database Check
     try:
         # Versuche eine einfache DB-Operation
-        await store.get_competitors()
+        await store.list_competitors()
         checks["database"] = True
     except Exception as e:
         logger.error(f"Database health check failed: {e}")

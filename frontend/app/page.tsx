@@ -74,28 +74,61 @@ export default function Home() {
   const [error, setError] = useState('');
   const [competitors, setCompetitors] = useState<Competitor[]>([]);
   const [isPolling, setIsPolling] = useState(false);
-  const [currentProgress, setCurrentProgress] = useState<{ done: number; total: number } | null>(null);
 
   const abortControllerRef = useRef<AbortController | null>(null);
+
+  const loadCompetitors = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/competitors`);
+      if (response.ok) {
+        const data = await response.json();
+        setCompetitors(data);
+      } else {
+        console.error('Fehler beim Laden der Competitors: HTTP', response.status);
+        setError(`Fehler beim Laden der Competitors: ${response.statusText}`);
+      }
+    } catch (err) {
+      console.error('Fehler beim Laden der Competitors:', err);
+      setError('Netzwerkfehler beim Laden der Competitors');
+    }
+  }, []);
+
+  const loadSnapshotDetails = useCallback(async (snapshotId: string) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/snapshots/${snapshotId}`);
+      if (response.ok) {
+        const details: SnapshotDetails = await response.json();
+        setSnapshotDetails(details);
+      } else {
+        console.error('Fehler beim Laden der Snapshot-Details: HTTP', response.status);
+        setError(`Fehler beim Laden der Snapshot-Details: ${response.statusText}`);
+      }
+    } catch (err) {
+      console.error('Fehler beim Laden der Snapshot-Details:', err);
+      setError('Netzwerkfehler beim Laden der Snapshot-Details');
+    }
+  }, []);
 
   // Lade alle Competitors beim ersten Laden
   useEffect(() => {
     loadCompetitors();
-  }, []);
+  }, [loadCompetitors]);
 
   // Status Polling für laufende Scans
   useEffect(() => {
     let intervalId: NodeJS.Timeout | null = null;
+    let isPollingActive = false;
 
     if (isPolling && scanResult?.snapshot_id) {
-      intervalId = setInterval(async () => {
+      const pollStatus = async () => {
+        // Verhindere gleichzeitige Requests
+        if (isPollingActive) return;
+
+        isPollingActive = true;
         try {
           const response = await fetch(`${API_BASE_URL}/api/snapshots/${scanResult.snapshot_id}/status`);
           if (response.ok) {
             const statusData = await response.json();
-
-            // Update Progress
-            setCurrentProgress(statusData.progress);
 
             // Update ScanResult Progress
             setScanResult(prev => prev ? {
@@ -107,17 +140,26 @@ export default function Home() {
             // Stoppe Polling wenn fertig oder fehlgeschlagen
             if (statusData.status === 'done' || statusData.status === 'failed') {
               setIsPolling(false);
-              if (statusData.status === 'done') {
+              if (statusData.status === 'done' && scanResult.snapshot_id) {
                 // Lade finale Snapshot-Daten
                 await loadSnapshotDetails(scanResult.snapshot_id);
+              } else if (statusData.status === 'failed') {
+                setError(statusData.error?.message || 'Scan fehlgeschlagen');
               }
             }
+          } else {
+            console.error('Fehler beim Status-Polling: HTTP', response.status);
+            // Bei HTTP-Fehler nicht sofort stoppen, könnte temporär sein
           }
         } catch (err) {
           console.error('Fehler beim Status-Polling:', err);
-          setIsPolling(false);
+          // Bei Netzwerkfehler nicht sofort stoppen, könnte temporär sein
+        } finally {
+          isPollingActive = false;
         }
-      }, 2500); // Alle 2.5 Sekunden
+      };
+
+      intervalId = setInterval(pollStatus, 2500); // Alle 2.5 Sekunden
     }
 
     return () => {
@@ -134,18 +176,6 @@ export default function Home() {
     };
   }, []);
 
-  const loadCompetitors = async () => {
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/competitors`);
-      if (response.ok) {
-        const data = await response.json();
-        setCompetitors(data);
-      }
-    } catch (err) {
-      console.error('Fehler beim Laden der Competitors:', err);
-    }
-  };
-
   // URL-Normalisierung wurde ins Backend verschoben
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -160,7 +190,6 @@ export default function Home() {
     setScanResult(null);
     setSnapshotDetails(null);
     setIsPolling(false);
-    setCurrentProgress(null);
 
     // URL wird jetzt im Backend normalisiert
 
@@ -192,7 +221,6 @@ export default function Home() {
       }
 
       setScanResult(result);
-      setCurrentProgress(result.progress || null);
 
       // Snapshot-Details laden, wenn verfügbar
       if (result.snapshot_id) {
@@ -216,20 +244,6 @@ export default function Home() {
       setIsLoading(false);
     }
   };
-
-  const loadSnapshotDetails = useCallback(async (snapshotId: string) => {
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/snapshots/${snapshotId}`);
-      if (response.ok) {
-        const details: SnapshotDetails = await response.json();
-        setSnapshotDetails(details);
-      } else {
-        console.error('Fehler beim Laden der Snapshot-Details');
-      }
-    } catch (err) {
-      console.error('Fehler beim Laden der Snapshot-Details:', err);
-    }
-  }, []);
 
   const formatDate = (dateString: string) => {
     return new Date(dateString).toLocaleString('de-DE');

@@ -102,7 +102,7 @@ def is_same_domain(url1: str, url2: str) -> bool:
         domain1 = urlparse(url1).netloc.lower().replace('www.', '')
         domain2 = urlparse(url2).netloc.lower().replace('www.', '')
         return domain1 == domain2
-    except:
+    except Exception:
         return False
 
 

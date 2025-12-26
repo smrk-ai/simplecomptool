@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
@@ -9,6 +10,7 @@ import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from services.browser_manager import browser_manager
+from services.persistence import extract_text_from_html
 
 # Logging konfigurieren
 logging.basicConfig(level=logging.INFO)
@@ -428,3 +430,104 @@ async def discover_urls(start_url: str) -> List[str]:
         except Exception as fallback_error:
             logger.error(f"Konnte auch Fallback-URL nicht normalisieren: {fallback_error}")
             return []
+
+
+async def fetch_with_httpx(url: str, timeout: int = 15) -> str:
+    """
+    Fast HTTP fetch mit httpx.
+    Timeout: 15 Sekunden
+    """
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=True,
+        headers={'User-Agent': 'Mozilla/5.0 (compatible; SimpleCompTool/1.0)'}
+    ) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        return response.text
+
+
+async def fetch_with_playwright(url: str, timeout: int = 30000) -> str:
+    """
+    Browser fetch für JS-heavy Sites.
+    Timeout: 30 Sekunden
+    """
+    browser = await browser_manager.get_browser()
+    context = await browser.new_context(
+        user_agent='Mozilla/5.0 (compatible; SimpleCompTool/1.0)'
+    )
+    page = await context.new_page()
+
+    try:
+        await page.goto(url, wait_until='networkidle', timeout=timeout)
+        html = await page.content()
+        return html
+    finally:
+        await page.close()
+        await context.close()
+
+
+async def fetch_page_smart(
+    url: str,
+    force_playwright: bool = False,
+    min_content_chars: int = 500
+) -> dict:
+    """
+    SMART HYBRID FETCH:
+    1. Try httpx (fast)
+    2. If content < 500 chars → Playwright retry
+    3. Return result
+
+    Returns:
+    {
+        'url': str,
+        'html': str,
+        'via': 'httpx' | 'playwright' | 'playwright-fallback' | 'playwright-error-fallback',
+        'duration': float (seconds),
+        'content_length': int (chars)
+    }
+    """
+    start_time = time.time()
+    via = None
+
+    if force_playwright:
+        # User wants Playwright
+        html = await fetch_with_playwright(url)
+        via = "playwright"
+    else:
+        try:
+            # Try httpx first (fast)
+            html_httpx = await fetch_with_httpx(url)
+            text_httpx = extract_text_from_html(html_httpx)
+
+            # Content Check
+            if len(text_httpx.strip()) >= min_content_chars:
+                # Genug Content → httpx reicht
+                html = html_httpx
+                via = "httpx"
+            else:
+                # Zu wenig Content → Playwright retry
+                logger.info(f"⚠️  Low content ({len(text_httpx)} chars), retrying with Playwright: {url}")
+                html = await fetch_with_playwright(url)
+                via = "playwright-fallback"
+
+        except Exception as e:
+            # httpx failed → Playwright fallback
+            logger.warning(f"❌ httpx failed: {e}, trying Playwright: {url}")
+            html = await fetch_with_playwright(url)
+            via = "playwright-error-fallback"
+
+    # Final metrics
+    duration = time.time() - start_time
+    text_final = extract_text_from_html(html)
+    content_length = len(text_final)
+
+    logger.info(f"✅ {url} via {via} in {duration:.2f}s → {content_length} chars")
+
+    return {
+        'url': url,
+        'html': html,
+        'via': via,
+        'duration': duration,
+        'content_length': content_length
+    }

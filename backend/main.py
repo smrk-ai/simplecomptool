@@ -20,7 +20,7 @@ load_dotenv(dotenv_path=str(env_path))
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 
 from services.crawler import (
-    discover_urls, fetch_url, 
+    discover_urls, fetch_url, fetch_page_smart,
     get_playwright_usage_count, reset_playwright_usage_count,
     MAX_URLS, MAX_CONCURRENT_FETCHES
 )
@@ -53,6 +53,7 @@ class ScanRequest(BaseModel):
     name: Optional[str] = None
     url: str
     llm: bool = False
+    use_playwright: bool = False  # ✅ NEU: User-Toggle
 
 class PageInfo(BaseModel):
     id: str
@@ -272,12 +273,25 @@ async def scan_endpoint(request: ScanRequest):
                 nonlocal fetch_success_count, fetch_error_count
                 async with semaphore:  # Concurrency-Control
                     try:
-                        # URL fetchen
-                        fetch_result = await fetch_url(url)
-                        fetch_result['original_url'] = url
+                        # ✅ Nutze Smart Fetch
+                        fetch_result = await fetch_page_smart(
+                            url,
+                            force_playwright=request.use_playwright
+                        )
+
+                        # Konvertiere zu altem fetch_url Format für save_page Kompatibilität
+                        fetch_result_compat = {
+                            'final_url': fetch_result['url'],
+                            'status': 200,  # Smart fetch gibt keinen Status zurück
+                            'headers': {},
+                            'html': fetch_result['html'],
+                            'fetched_at': datetime.now().isoformat(),
+                            'via': fetch_result['via'],
+                            'original_url': url
+                        }
 
                         # Page speichern (inkl. Dateien und Social Links)
-                        page_info = save_page(snapshot_id, fetch_result, competitor_id)
+                        page_info = save_page(snapshot_id, fetch_result_compat, competitor_id)
 
                         if page_info:
                             fetch_success_count += 1

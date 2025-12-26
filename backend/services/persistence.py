@@ -105,10 +105,8 @@ def init_db():
 
 def extract_text_from_html(html: str) -> Tuple[str, str, str]:
     """
-    Extrahiert Titel, Meta-Description und normalisierten Text aus HTML
-
-    Returns:
-        (title, meta_description, normalized_text)
+    DEPRECATED: Nutze extract_text_from_html_v2() stattdessen!
+    Diese Funktion hat 50k Limit und verliert Content!
     """
     try:
         soup = BeautifulSoup(html, 'lxml')
@@ -146,6 +144,51 @@ def extract_text_from_html(html: str) -> Tuple[str, str, str]:
     except Exception as e:
         logger.warning(f"Fehler bei Text-Extraktion: {e}")
         return "", "", ""
+
+
+def extract_text_from_html_v2(html: str) -> dict:
+    """
+    Extrahiert VOLLSTÄNDIGEN Text mit Struktur-Metadaten.
+    KEIN 50k Limit mehr!
+
+    Returns:
+    {
+        'text': str,              # Vollständiger normalisierter Text
+        'text_length': int,       # Länge in chars
+        'has_truncation': bool,   # Immer False (kein Limit)
+        'extraction_version': 'v2'
+    }
+    """
+    from bs4 import BeautifulSoup
+    import re
+
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # Entferne nur Scripts/Styles/SVG
+    for tag in soup(['script', 'style', 'noscript', 'svg', 'iframe']):
+        tag.decompose()
+
+    # Extrahiere Text mit Struktur (Newlines zwischen Elementen)
+    text_parts = []
+    for element in soup.find_all(text=True):
+        text = element.strip()
+        if text and len(text) > 0:
+            text_parts.append(text)
+
+    # Join mit Newlines (behält Absätze)
+    full_text = '\n'.join(text_parts)
+
+    # Normalisiere Whitespace (aber behalte Newlines)
+    full_text = re.sub(r' +', ' ', full_text)          # Mehrfach-Spaces → 1 Space
+    full_text = re.sub(r'\n\n+', '\n\n', full_text)    # Max 2 Newlines
+    full_text = full_text.strip()
+
+    return {
+        'text': full_text,
+        'text_length': len(full_text),
+        'has_truncation': False,  # Kein Limit mehr!
+        'extraction_version': 'v2'
+    }
 
 
 def calculate_text_hash(text: str) -> str:

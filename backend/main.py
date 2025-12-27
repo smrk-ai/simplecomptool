@@ -35,7 +35,27 @@ def _get_cors_origins() -> List[str]:
     Wildcard (*) ist gefährlich, da jede Website dann API-Requests machen kann.
     Dies öffnet CSRF-Angriffsvektoren.
     """
-    origins_str = os.getenv("CORS_ORIGINS", "http://localhost:3000")
+    origins_str = os.getenv("CORS_ORIGINS")
+
+    # Check if running in production
+    is_production = bool(
+        os.getenv("RAILWAY_ENVIRONMENT") or
+        os.getenv("VERCEL") or
+        os.getenv("PRODUCTION")
+    )
+
+    # Production: CORS_ORIGINS is REQUIRED
+    if not origins_str:
+        if is_production:
+            raise ValueError(
+                "❌ CRITICAL: CORS_ORIGINS environment variable must be set in production!\n"
+                "Example: CORS_ORIGINS=https://myapp.vercel.app,https://myapp.com\n"
+                "This prevents your API from being inaccessible to your frontend."
+            )
+        else:
+            logger.info("🔧 Development mode: Using localhost as CORS origin")
+            return ["http://localhost:3000"]
+
     origins = [origin.strip() for origin in origins_str.split(",") if origin.strip()]
 
     # Security Check: Wildcard blockieren

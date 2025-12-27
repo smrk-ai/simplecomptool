@@ -14,7 +14,11 @@ from dotenv import load_dotenv
 # Environment Variables laden
 import pathlib
 env_path = pathlib.Path(__file__).parent.parent / ".env.local"
-load_dotenv(dotenv_path=str(env_path))
+# Nur laden wenn Datei existiert (lokal), in Production nutzt Railway eigene Env-Vars
+if env_path.exists():
+    load_dotenv(dotenv_path=str(env_path))
+else:
+    load_dotenv()  # Lädt aus System-Environment
 
 # CORS-Konfiguration aus Environment-Variable mit Security-Validierung
 def _get_cors_origins() -> List[str]:
@@ -77,6 +81,17 @@ app.add_middleware(
 # Datenbank-Pfad
 DB_PATH = "data/app.db"
 os.makedirs("data", exist_ok=True)
+
+# Health Check Endpoints für Railway
+@app.get("/health/ready")
+async def health_ready():
+    """Health check endpoint for Railway"""
+    return {"status": "ready", "timestamp": datetime.now().isoformat()}
+
+@app.get("/health/live")
+async def health_live():
+    """Liveness check endpoint"""
+    return {"status": "alive", "timestamp": datetime.now().isoformat()}
 
 # Scan-Konfiguration aus Environment-Variablen
 GLOBAL_SCAN_TIMEOUT = float(os.getenv("GLOBAL_SCAN_TIMEOUT", "60.0"))

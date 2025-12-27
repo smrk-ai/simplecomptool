@@ -113,7 +113,11 @@ export default function Home() {
         // Versuche JSON-Error zu parsen (Backend sendet ErrorDetail)
         try {
           const errorData = await response.json();
-          if (errorData.error) {
+          // Backend sendet: {"detail": {"error": {...}}} (FastAPI format)
+          if (errorData.detail?.error) {
+            setError(`${errorData.detail.error.code}: ${errorData.detail.error.message}`);
+          } else if (errorData.error) {
+            // Fallback für altes Format
             setError(`${errorData.error.code}: ${errorData.error.message}`);
           } else {
             setError(`HTTP ${response.status}: ${response.statusText}`);

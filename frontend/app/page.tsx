@@ -2,6 +2,12 @@
 
 import { useState, useEffect } from 'react';
 
+/**
+ * BRANDING COLORS:
+ * Primary:   #a3418f (Lila)
+ * Secondary: #2d897f (Türkis)
+ */
+
 // API-Base-URL aus Environment-Variable
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
@@ -40,17 +46,6 @@ interface SnapshotDetails {
   pages?: PageInfo[];
 }
 
-interface Competitor {
-  id: string;
-  name?: string;
-  url: string;
-  created_at: string;
-  snapshots?: Array<{
-    id: string;
-    url: string;
-    created_at: string;
-  }>;
-}
 
 export default function Home() {
   const [url, setUrl] = useState('');
@@ -58,24 +53,8 @@ export default function Home() {
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
   const [snapshotDetails, setSnapshotDetails] = useState<SnapshotDetails | null>(null);
   const [error, setError] = useState('');
-  const [competitors, setCompetitors] = useState<Competitor[]>([]);
 
-  // Lade alle Competitors beim ersten Laden
-  useEffect(() => {
-    loadCompetitors();
-  }, []);
 
-  const loadCompetitors = async () => {
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/competitors`);
-      if (response.ok) {
-        const data = await response.json();
-        setCompetitors(data);
-      }
-    } catch (err) {
-      console.error('Fehler beim Laden der Competitors:', err);
-    }
-  };
 
   const normalizeUrl = (input: string): string => {
     const trimmed = input.trim();
@@ -113,7 +92,7 @@ export default function Home() {
       });
 
       const result: ScanResult = await response.json();
-      
+
       if (!result.ok) {
         // Fehler vom Backend (strukturiert)
         setScanResult(result);
@@ -125,15 +104,19 @@ export default function Home() {
         return;
       }
 
-      setScanResult(result);
+      // Sofort zur Results-Seite weiterleiten
+      if (result.ok && result.snapshot_id) {
+        window.location.href = `/results/${result.snapshot_id}`;
+      } else {
+        // Fallback: altes Verhalten (wenn kein snapshot_id)
+        setScanResult(result);
+      }
 
       // Snapshot-Details laden, wenn verfügbar
       if (result.snapshot_id) {
         await loadSnapshotDetails(result.snapshot_id);
       }
 
-      // Competitors neu laden
-      await loadCompetitors();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unbekannter Fehler');
     } finally {
@@ -160,7 +143,8 @@ export default function Home() {
   };
 
   return (
-    <div className="container">
+    <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+      <div className="container w-full max-w-4xl p-8" style={{ marginTop: '5rem' }}>
       <h1>Simple CompTool</h1>
 
       <form onSubmit={handleSubmit}>
@@ -170,13 +154,19 @@ export default function Home() {
             id="url"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            placeholder="z.B. bild.de oder https://www.beispiel.de"
+            placeholder="z.B. bild.de"
             required
             className="url-input"
           />
         </div>
 
-        <button type="submit" disabled={isLoading}>
+        {/* Brand Color: #2d897f (Türkis) */}
+        <button
+          type="submit"
+          disabled={isLoading}
+          className="w-2/3 mx-auto block text-white py-3 px-6 rounded-lg font-semibold hover:opacity-90 transition disabled:opacity-50"
+          style={{ backgroundColor: '#2d897f' }}
+        >
           {isLoading ? 'Scanne...' : 'Scan starten'}
         </button>
       </form>
@@ -325,34 +315,7 @@ export default function Home() {
         </div>
       )}
 
-      {competitors.length > 0 && (
-        <div className="competitors-list">
-          <h2>Gespeicherte Competitors</h2>
-          {competitors.map((competitor) => (
-            <div key={competitor.id} className="competitor-item">
-              <h3>{competitor.name || 'Unbenannt'} ({competitor.url})</h3>
-              <div style={{ fontSize: '14px', color: '#666', marginBottom: '10px' }}>
-                Erstellt: {formatDate(competitor.created_at)}
-              </div>
-
-              <div className="snapshot-list">
-                <strong>Snapshots:</strong>
-                {competitor.snapshots && competitor.snapshots.length > 0 ? (
-                  competitor.snapshots.map((snapshot) => (
-                    <div key={snapshot.id} className="snapshot-item">
-                      {formatDate(snapshot.created_at)} - {snapshot.url}
-                    </div>
-                  ))
-                ) : (
-                  <div className="snapshot-item" style={{ fontStyle: 'italic', color: '#999' }}>
-                    Keine Snapshots vorhanden
-                  </div>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
+      </div>
     </div>
   );
 }

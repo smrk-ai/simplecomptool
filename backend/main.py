@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -10,6 +10,9 @@ import uuid
 import time
 import logging
 from dotenv import load_dotenv
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Logger konfigurieren (VOR allen anderen Initialisierungen)
 logging.basicConfig(level=logging.INFO)
@@ -73,6 +76,11 @@ from utils.url_utils import canonicalize_url
 from validators import validate_scan_url, validate_competitor_name
 
 app = FastAPI(title="Simple CompTool Backend", version="1.0.0")
+
+# Rate Limiting Setup
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS für Frontend-Zugriff
 app.add_middleware(
@@ -258,7 +266,8 @@ def get_snapshot(snapshot_id: str) -> Optional[dict]:
 
 # API Endpoints
 @app.post("/api/scan", response_model=ScanResponse)
-async def scan_endpoint(request: ScanRequest):
+@limiter.limit("5/minute")
+async def scan_endpoint(http_request: Request, request: ScanRequest):
     """
     Vollständiger Website-Scan mit Crawling und Persistenz
     Optional: LLM-basierte Profil-Erstellung

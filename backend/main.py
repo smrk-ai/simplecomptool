@@ -98,15 +98,6 @@ async def health_live():
     """Liveness check endpoint"""
     return {"status": "alive", "timestamp": datetime.now().isoformat()}
 
-@app.get("/debug/cors")
-async def debug_cors():
-    """Debug endpoint to check CORS configuration"""
-    return {
-        "cors_origins": CORS_ORIGINS,
-        "cors_origins_env": os.getenv("CORS_ORIGINS", "NOT_SET"),
-        "timestamp": datetime.now().isoformat()
-    }
-
 # Scan-Konfiguration aus Environment-Variablen
 GLOBAL_SCAN_TIMEOUT = float(os.getenv("GLOBAL_SCAN_TIMEOUT", "60.0"))
 

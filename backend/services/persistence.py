@@ -103,47 +103,8 @@ def init_db():
         logger.warning("SERVICE_ROLE_KEY nicht verfügbar - Buckets müssen manuell erstellt werden")
 
 
-def extract_text_from_html(html: str) -> Tuple[str, str, str]:
-    """
-    DEPRECATED: Nutze extract_text_from_html_v2() stattdessen!
-    Diese Funktion hat 50k Limit und verliert Content!
-    """
-    try:
-        soup = BeautifulSoup(html, 'lxml')
-
-        # Titel extrahieren
-        title = ""
-        title_tag = soup.find('title')
-        if title_tag:
-            title = title_tag.get_text().strip()
-
-        # Meta description extrahieren
-        meta_description = ""
-        meta_desc = soup.find('meta', attrs={'name': 'description'})
-        if meta_desc and meta_desc.get('content'):
-            meta_description = meta_desc['content'].strip()
-
-        # Haupttext extrahieren
-        # Entferne script, style, noscript Tags
-        for tag in soup(['script', 'style', 'noscript']):
-            tag.extract()
-
-        # Extrahiere sichtbaren Text
-        text = soup.get_text()
-
-        # Normalisiere Whitespace
-        # Mehrere Leerzeichen/Zeilen zu einem zusammenfassen
-        normalized_text = re.sub(r'\s+', ' ', text.strip())
-
-        # Optional: Warning bei sehr großen Texten
-        if len(normalized_text) > 200000:
-            logger.warning(f"Very large text extracted: {len(normalized_text)} chars")
-
-        return title, meta_description, normalized_text
-
-    except Exception as e:
-        logger.warning(f"Fehler bei Text-Extraktion: {e}")
-        return "", "", ""
+# DELETED: extract_text_from_html() - deprecated v1 function with 50k limit
+# Use extract_text_from_html_v2() instead
 
 
 def extract_text_from_html_v2(html: str) -> dict:
@@ -232,12 +193,46 @@ def extract_social_links(html: str, base_url: str) -> List[Dict]:
 
 
 def get_or_create_competitor(base_url: str, name: Optional[str] = None) -> str:
-    """Holt oder erstellt einen Competitor anhand der base_url"""
+    """
+    Holt oder erstellt einen Competitor anhand der base_url.
+
+    SECURITY FIX: Input Validation für base_url.
+
+    Args:
+        base_url: URL der Competitor-Website
+        name: Optional - Name des Competitors
+
+    Returns:
+        Competitor ID (UUID)
+
+    Raises:
+        ValueError: Wenn base_url ungültig ist
+        RuntimeError: Wenn Supabase nicht initialisiert ist
+    """
     if not supabase:
         raise RuntimeError("Supabase nicht initialisiert")
 
+    # INPUT VALIDATION
+    if not base_url or not isinstance(base_url, str):
+        raise ValueError("base_url muss ein nicht-leerer String sein")
+
+    base_url = base_url.strip()
+    if not base_url:
+        raise ValueError("base_url darf nicht leer sein")
+
     # Normalisiere base_url
-    parsed = urlparse(base_url)
+    try:
+        parsed = urlparse(base_url)
+    except Exception as e:
+        raise ValueError(f"Ungültige URL: {base_url}") from e
+
+    # Validierung: Scheme und Netloc müssen vorhanden sein
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"URL muss Schema und Domain enthalten: {base_url}")
+
+    if parsed.scheme not in ['http', 'https']:
+        raise ValueError(f"URL-Schema muss http oder https sein: {parsed.scheme}")
+
     normalized_base_url = f"{parsed.scheme}://{parsed.netloc}"
 
     try:
@@ -306,10 +301,17 @@ def save_page(snapshot_id: str, fetch_result: Dict, competitor_id: str) -> Dict:
 
     page_id = str(uuid.uuid4())
 
-    # Text-Extraktion mit v2
-    extraction_result = extract_text_from_html_v2(fetch_result['html'])
-    normalized_text = extraction_result['text']
-    sha256_text = calculate_text_hash(normalized_text)
+    # PERFORMANCE FIX: Nutze pre-extracted text & hash wenn vorhanden
+    # Fallback: Extract on-demand (für alte Codepfade)
+    if '_extracted_text' in fetch_result and '_sha256_text' in fetch_result:
+        # Pre-extracted (Performance-optimiert)
+        normalized_text = fetch_result['_extracted_text']
+        sha256_text = fetch_result['_sha256_text']
+    else:
+        # Fallback: On-demand extraction
+        extraction_result = extract_text_from_html_v2(fetch_result['html'])
+        normalized_text = extraction_result['text']
+        sha256_text = calculate_text_hash(normalized_text)
 
     # Extract title and meta_description from HTML
     try:
@@ -345,8 +347,43 @@ def save_page(snapshot_id: str, fetch_result: Dict, competitor_id: str) -> Dict:
         )
 
     except Exception as e:
-        logger.error(f"Fehler beim Hochladen der Dateien für Page {page_id}: {e}")
-        return None
+        """
+        CRITICAL FIX: Detailliertes Error Handling für Storage-Fehler.
+
+        Mögliche Fehlerquellen:
+        - Storage Quota erreicht
+        - Netzwerk-Timeout
+        - Supabase Service Down
+        - Datei zu groß
+        """
+        error_str = str(e).lower()
+
+        # Storage Quota (kritisch - kein weiterer Upload möglich)
+        if "quota" in error_str or "storage limit" in error_str:
+            logger.critical(f"🚨 STORAGE QUOTA EXCEEDED! Cannot save page {page_id}")
+            logger.critical(f"🚨 HTML size: {len(html_bytes)} bytes, Text size: {len(txt_bytes)} bytes")
+            raise RuntimeError(f"Storage quota exceeded: {e}")
+
+        # Timeout (retry möglich)
+        elif "timeout" in error_str or "timed out" in error_str:
+            logger.error(f"⏱️  Upload timeout for page {page_id}: {e}")
+            # TODO: Implement retry logic
+            return None
+
+        # Netzwerk-Fehler
+        elif "network" in error_str or "connection" in error_str:
+            logger.error(f"🌐 Network error uploading page {page_id}: {e}")
+            return None
+
+        # Datei zu groß
+        elif "too large" in error_str or "size" in error_str:
+            logger.error(f"📦 File too large for page {page_id}: HTML={len(html_bytes)} bytes, Text={len(txt_bytes)} bytes")
+            return None
+
+        # Unbekannter Fehler
+        else:
+            logger.error(f"❌ Unknown storage error for page {page_id}: {e}")
+            return None
 
     # Content-Type ermitteln
     content_type = fetch_result.get('headers', {}).get('content-type', 'text/html')
@@ -633,58 +670,9 @@ def get_competitor_profile(competitor_id: str, snapshot_id: Optional[str] = None
         return None
 
 
-def canonicalize_url(url: str) -> str:
-    """
-    Normalisiert URL für Vergleich:
-    - https (immer)
-    - ohne www
-    - ohne Fragment (#)
-    - ohne Tracking-Params (utm_*, fbclid, gclid, etc.)
-    - lowercase domain
-    - path ohne trailing slash (außer root /)
-
-    Beispiel:
-    https://WWW.example.com/page/?utm_source=google#section
-    → https://example.com/page
-    """
-    from urllib.parse import urlparse, urlunparse
-    import re
-
-    url = url.lower().strip()
-    parsed = urlparse(url)
-
-    # Entferne www
-    netloc = parsed.netloc
-    if netloc.startswith('www.'):
-        netloc = netloc[4:]
-
-    # Entferne Tracking-Params
-    query = parsed.query
-    if query:
-        params = []
-        for param in query.split('&'):
-            if not param:
-                continue
-            key = param.split('=')[0]
-            # Blocke bekannte Tracking-Params
-            tracking_prefixes = ['utm_', 'fbclid', 'gclid', 'mc_', '_ga', 'ref', 'source']
-            if not any(key.startswith(p) for p in tracking_prefixes):
-                params.append(param)
-        query = '&'.join(params)
-
-    # Entferne trailing slash (außer root)
-    path = parsed.path.rstrip('/') if parsed.path != '/' else '/'
-
-    canonical = urlunparse((
-        'https',           # Immer HTTPS
-        netloc,            # Domain ohne www
-        path,              # Path ohne trailing slash
-        '',                # Params (leer)
-        query,             # Query ohne Tracking
-        ''                 # Fragment (leer)
-    ))
-
-    return canonical
+# DEPRECATED: Moved to utils.url_utils
+# Import zentrale Funktion
+from utils.url_utils import canonicalize_url
 
 
 async def get_previous_snapshot_map(competitor_id: str) -> dict:

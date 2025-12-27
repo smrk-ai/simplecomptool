@@ -10,7 +10,8 @@ import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from services.browser_manager import browser_manager
-from services.persistence import extract_text_from_html, extract_text_from_html_v2
+from services.persistence import extract_text_from_html_v2
+from utils.url_utils import canonicalize_url as canonicalize_url_central, is_same_domain as is_same_domain_util
 
 # Logging konfigurieren
 logging.basicConfig(level=logging.INFO)
@@ -26,8 +27,10 @@ MAX_CONCURRENT_FETCHES = 5  # Max 5 parallele Fetches
 # User-Agent
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 
-# Playwright-Usage Counter (für Logging)
+# Playwright-Usage Counter (für Logging) - Thread-Safe
+import threading
 _playwright_usage_count = 0
+_playwright_counter_lock = threading.Lock()
 
 # Keywords für Priorisierung
 PRIORITY_KEYWORDS = [
@@ -51,66 +54,15 @@ FILTERED_EXTENSIONS = [
 ]
 
 
+# DEPRECATED: Moved to utils.url_utils - Use canonicalize_url_central instead
 def normalize_url(url: str, base_url: str = None) -> str:
-    """
-    Normalisiert eine URL:
-    - Fügt HTTPS hinzu, wenn kein Schema vorhanden
-    - Konvertiert HTTP zu HTTPS
-    - Entfernt Fragments (#)
-    - Entfernt Tracking-Parameter (utm_*, fbclid, gclid)
-    - Resolved relative URLs
-    """
-    try:
-        if base_url:
-            url = urljoin(base_url, url)
-
-        parsed = urlparse(url)
-
-        # Wenn kein Schema vorhanden, HTTPS hinzufügen
-        if not parsed.scheme:
-            # Wenn netloc vorhanden (z.B. "grafiklabor.de"), dann ist es eine Domain
-            if parsed.netloc:
-                parsed = parsed._replace(scheme='https')
-            # Sonst könnte es ein relativer Pfad sein - füge https:// hinzu
-            elif url and not url.startswith('/'):
-                url = f"https://{url}"
-                parsed = urlparse(url)
-
-        # HTTPS erzwingen (falls HTTP vorhanden)
-        if parsed.scheme == 'http':
-            parsed = parsed._replace(scheme='https')
-
-        # Fragment entfernen
-        parsed = parsed._replace(fragment='')
-
-        # Query-Parameter filtern
-        if parsed.query:
-            query_params = parse_qs(parsed.query)
-            filtered_params = {
-                k: v for k, v in query_params.items()
-                if not (k.startswith('utm_') or k in ['fbclid', 'gclid'])
-            }
-            if filtered_params:
-                parsed = parsed._replace(query=urlencode(filtered_params, doseq=True))
-            else:
-                parsed = parsed._replace(query='')
-
-        return urlunparse(parsed)
-    except Exception as e:
-        logger.warning(f"Fehler beim Normalisieren der URL {url}: {e}")
-        return url
+    """DEPRECATED: Use utils.url_utils.canonicalize_url() instead"""
+    return canonicalize_url_central(url, base_url)
 
 
 def is_same_domain(url1: str, url2: str) -> bool:
-    """
-    Prüft, ob zwei URLs die gleiche Domain haben (inkl. www-Variante)
-    """
-    try:
-        domain1 = urlparse(url1).netloc.lower().replace('www.', '')
-        domain2 = urlparse(url2).netloc.lower().replace('www.', '')
-        return domain1 == domain2
-    except:
-        return False
+    """DEPRECATED: Use utils.url_utils.is_same_domain() instead"""
+    return is_same_domain_util(url1, url2)
 
 
 def should_filter_url(url: str, base_domain: str) -> bool:
@@ -219,14 +171,35 @@ def requires_javascript(html: str) -> bool:
 
 
 def get_playwright_usage_count() -> int:
-    """Gibt die Anzahl der Playwright-Aufrufe zurück (für Logging)"""
-    return _playwright_usage_count
+    """
+    Gibt die Anzahl der Playwright-Aufrufe zurück (für Logging).
+
+    THREAD-SAFE FIX: Lock für Counter-Zugriff.
+    """
+    with _playwright_counter_lock:
+        return _playwright_usage_count
 
 
 def reset_playwright_usage_count():
-    """Setzt den Playwright-Usage-Counter zurück"""
+    """
+    Setzt den Playwright-Usage-Counter zurück.
+
+    THREAD-SAFE FIX: Lock für Counter-Reset.
+    """
     global _playwright_usage_count
-    _playwright_usage_count = 0
+    with _playwright_counter_lock:
+        _playwright_usage_count = 0
+
+
+def _increment_playwright_usage_count():
+    """
+    Inkrementiert Playwright Counter (intern).
+
+    THREAD-SAFE FIX: Lock für Counter-Inkrement.
+    """
+    global _playwright_usage_count
+    with _playwright_counter_lock:
+        _playwright_usage_count += 1
 
 
 async def fetch_url(url: str) -> Dict:
@@ -406,7 +379,12 @@ async def fetch_with_playwright(url: str, timeout: int = 30000) -> str:
     """
     Browser fetch für JS-heavy Sites.
     Timeout: 30 Sekunden
+
+    THREAD-SAFE FIX: Inkrementiert Playwright-Counter.
     """
+    # Inkrementiere Counter (thread-safe)
+    _increment_playwright_usage_count()
+
     # ✅ Context Manager richtig nutzen
     async with browser_manager.get_browser() as browser:
         context = await browser.new_context(

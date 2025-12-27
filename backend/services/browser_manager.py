@@ -18,10 +18,18 @@ class BrowserManager:
     async def get_browser(self):
         """
         Thread-safe Browser Zugriff.
+
+        CRITICAL FIX: Lock wird NUR für Browser-Initialisierung gehalten,
+        NICHT für die gesamte Browser-Nutzung.
+
+        Dies ermöglicht echte Parallelität (z.B. 5 concurrent fetches),
+        da Playwright's Browser-Objekt intern thread-safe ist.
+
         Usage:
             async with browser_manager.get_browser() as browser:
                 page = await browser.new_page()
         """
+        # Lock NUR für Browser-Start (nicht für Zugriff!)
         async with self._lock:
             if not self._browser_started:
                 logger.info("Starting Playwright browser...")
@@ -37,11 +45,12 @@ class BrowserManager:
                 self._browser_started = True
                 logger.info("✅ Browser started")
 
-            try:
-                yield self._browser
-            except Exception as e:
-                logger.error(f"Browser error: {e}")
-                raise
+        # Browser-Zugriff außerhalb des Locks (Playwright ist intern thread-safe)
+        try:
+            yield self._browser
+        except Exception as e:
+            logger.error(f"Browser error: {e}")
+            raise
 
     async def close(self):
         """Shutdown Browser"""
@@ -59,4 +68,5 @@ class BrowserManager:
 
 # Global Instance
 browser_manager = BrowserManager()
+
 

@@ -79,6 +79,20 @@ export default function Home() {
     const normalizedUrl = normalizeUrl(url);
 
     try {
+      /**
+       * CRITICAL FIX: Robustes Error Handling für API-Requests
+       *
+       * Fehlerquellen:
+       * - Network Timeout (Server antwortet nicht)
+       * - HTTP 500/503 (Server-Fehler)
+       * - Malformed JSON Response
+       * - CORS-Fehler
+       */
+
+      // Request mit 2 Minuten Timeout (AbortSignal)
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 120000); // 120s
+
       const response = await fetch(`${API_BASE_URL}/api/scan`, {
         method: 'POST',
         headers: {
@@ -89,9 +103,36 @@ export default function Home() {
           url: normalizedUrl,
           llm: false, // Für jetzt ohne LLM
         }),
+        signal: controller.signal
       });
 
-      const result: ScanResult = await response.json();
+      clearTimeout(timeoutId);
+
+      // HTTP Error Handling (response.ok ist false bei 4xx/5xx)
+      if (!response.ok) {
+        // Versuche JSON-Error zu parsen (Backend sendet ErrorDetail)
+        try {
+          const errorData = await response.json();
+          if (errorData.error) {
+            setError(`${errorData.error.code}: ${errorData.error.message}`);
+          } else {
+            setError(`HTTP ${response.status}: ${response.statusText}`);
+          }
+        } catch {
+          // JSON-Parsing fehlgeschlagen → Generischer Error
+          setError(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        return;
+      }
+
+      // JSON Response parsen
+      let result: ScanResult;
+      try {
+        result = await response.json();
+      } catch (jsonError) {
+        setError('Server-Antwort konnte nicht verarbeitet werden (Invalid JSON)');
+        return;
+      }
 
       if (!result.ok) {
         // Fehler vom Backend (strukturiert)
@@ -118,7 +159,18 @@ export default function Home() {
       }
 
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unbekannter Fehler');
+      // Network-Fehler (Timeout, CORS, Connection refused)
+      if (err instanceof Error) {
+        if (err.name === 'AbortError') {
+          setError('⏱️ Scan-Timeout nach 2 Minuten. Bitte versuche es erneut.');
+        } else if (err.message.includes('fetch')) {
+          setError('🌐 Netzwerk-Fehler. Ist der Backend-Server erreichbar?');
+        } else {
+          setError(`Fehler: ${err.message}`);
+        }
+      } else {
+        setError('Unbekannter Fehler beim Scannen');
+      }
     } finally {
       setIsLoading(false);
     }

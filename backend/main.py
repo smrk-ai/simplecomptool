@@ -16,8 +16,39 @@ import pathlib
 env_path = pathlib.Path(__file__).parent.parent / ".env.local"
 load_dotenv(dotenv_path=str(env_path))
 
-# CORS-Konfiguration aus Environment-Variable
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+# CORS-Konfiguration aus Environment-Variable mit Security-Validierung
+def _get_cors_origins() -> List[str]:
+    """
+    SECURITY FIX: Validiert CORS Origins und verhindert Wildcard-Missbrauch.
+
+    Wildcard (*) ist gefährlich, da jede Website dann API-Requests machen kann.
+    Dies öffnet CSRF-Angriffsvektoren.
+    """
+    origins_str = os.getenv("CORS_ORIGINS", "http://localhost:3000")
+    origins = [origin.strip() for origin in origins_str.split(",") if origin.strip()]
+
+    # Security Check: Wildcard blockieren
+    if "*" in origins:
+        logger.warning("⚠️  CORS Wildcard (*) detected in CORS_ORIGINS - SECURITY RISK!")
+        logger.warning("⚠️  Falling back to localhost only for security")
+        return ["http://localhost:3000"]
+
+    # Validierung: Alle Origins müssen gültige URLs sein
+    valid_origins = []
+    for origin in origins:
+        if origin.startswith("http://") or origin.startswith("https://"):
+            valid_origins.append(origin)
+        else:
+            logger.warning(f"⚠️  Invalid CORS origin (must start with http:// or https://): {origin}")
+
+    if not valid_origins:
+        logger.warning("⚠️  No valid CORS origins found, using localhost")
+        return ["http://localhost:3000"]
+
+    logger.info(f"✅ CORS Origins configured: {', '.join(valid_origins)}")
+    return valid_origins
+
+CORS_ORIGINS = _get_cors_origins()
 
 from services.crawler import (
     discover_urls, fetch_url, fetch_page_smart,
@@ -27,9 +58,10 @@ from services.crawler import (
 from services.persistence import (
     init_db, get_or_create_competitor, create_snapshot, save_page,
     update_snapshot_page_count, get_snapshot_pages, get_competitor_socials,
-    create_profile_with_llm, extract_text_from_html_v2, canonicalize_url,
+    create_profile_with_llm, extract_text_from_html_v2,
     get_previous_snapshot_map, calculate_text_hash
 )
+from utils.url_utils import canonicalize_url
 
 app = FastAPI(title="Simple CompTool Backend", version="1.0.0")
 
@@ -292,6 +324,7 @@ async def scan_endpoint(request: ScanRequest):
                         duration = fetch_result['duration']
 
                         # ✅ Extract mit V2 (vollständiger Content, kein 50k Limit!)
+                        # PERFORMANCE FIX: Nur einmal extrahieren, dann an save_page() übergeben
                         extraction_result = extract_text_from_html_v2(html)
                         text = extraction_result['text']
                         text_length = extraction_result['text_length']
@@ -332,6 +365,7 @@ async def scan_endpoint(request: ScanRequest):
                         meta_description = meta_desc.get('content', '').strip() if meta_desc else None
 
                         # Konvertiere zu altem fetch_url Format für save_page Kompatibilität (mit neuen Feldern)
+                        # PERFORMANCE FIX: Text & Hash bereits extrahiert, als Parameter übergeben
                         fetch_result_compat = {
                             'final_url': fetch_result['url'],
                             'status': 200,  # Smart fetch gibt keinen Status zurück
@@ -348,7 +382,10 @@ async def scan_endpoint(request: ScanRequest):
                             'normalized_len': len(text),
                             'has_truncation': has_truncation,
                             'extraction_version': extraction_version,
-                            'fetch_duration': duration
+                            'fetch_duration': duration,
+                            # PERFORMANCE FIX: Pre-extracted text & hash
+                            '_extracted_text': text,
+                            '_sha256_text': sha256_new
                         }
 
                         # Page speichern (inkl. Dateien und Social Links)
@@ -634,7 +671,25 @@ async def download_text(page_id: str):
 # Startup Event
 @app.on_event("startup")
 def startup_event():
+    """Initialisiert Datenbank beim Server-Start"""
     init_db()
+    logger.info("✅ Application started")
+
+# Shutdown Event - CRITICAL FIX: Browser-Ressourcen freigeben
+@app.on_event("shutdown")
+async def shutdown_event():
+    """
+    Cleanup beim Server-Shutdown.
+
+    CRITICAL FIX: Verhindert Memory Leak durch Zombie-Chromium-Prozesse.
+    Ohne diesen Event bleibt der Browser-Prozess nach jedem Server-Restart aktiv.
+    """
+    from services.browser_manager import browser_manager
+    try:
+        await browser_manager.close()
+        logger.info("✅ Browser closed successfully")
+    except Exception as e:
+        logger.error(f"❌ Error closing browser: {e}")
 
 if __name__ == "__main__":
     import uvicorn

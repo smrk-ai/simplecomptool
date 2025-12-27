@@ -71,36 +71,26 @@ def init_db():
 
     logger.info("Supabase-Verbindung initialisiert")
 
-    # Erstelle Buckets mit Service Role Key falls verfügbar
+    # FIXED: Erstelle einen gemeinsamen 'snapshots' Bucket
+    # (statt separate html-files und txt-files Buckets)
     if SERVICE_ROLE_KEY:
         admin_client = create_client(SUPABASE_URL, SERVICE_ROLE_KEY)
 
-        # Stelle sicher, dass die Buckets existieren
+        # Stelle sicher, dass der Bucket existiert
         try:
-            # HTML-Dateien Bucket
-            admin_client.storage.create_bucket("html-files")
-            logger.info("Bucket 'html-files' erstellt")
+            # Snapshots Bucket für HTML und TXT Files
+            admin_client.storage.create_bucket("snapshots")
+            logger.info("Bucket 'snapshots' erstellt")
         except Exception as e:
             error_str = str(e).lower()
             if "already exists" in error_str or "duplicate" in error_str:
-                logger.info("Bucket 'html-files' existiert bereits")
+                logger.info("Bucket 'snapshots' existiert bereits")
             else:
-                logger.warning(f"Fehler beim Erstellen des HTML-Buckets: {e}")
-
-        try:
-            # TXT-Dateien Bucket
-            admin_client.storage.create_bucket("txt-files")
-            logger.info("Bucket 'txt-files' erstellt")
-        except Exception as e:
-            error_str = str(e).lower()
-            if "already exists" in error_str or "duplicate" in error_str:
-                logger.info("Bucket 'txt-files' existiert bereits")
-            else:
-                logger.warning(f"Fehler beim Erstellen des TXT-Buckets: {e}")
+                logger.warning(f"Fehler beim Erstellen des Snapshots-Buckets: {e}")
 
         logger.info("Supabase Storage Buckets bereit")
     else:
-        logger.warning("SERVICE_ROLE_KEY nicht verfügbar - Buckets müssen manuell erstellt werden")
+        logger.warning("SERVICE_ROLE_KEY nicht verfügbar - Bucket 'snapshots' muss manuell erstellt werden")
 
 
 # DELETED: extract_text_from_html() - deprecated v1 function with 50k limit

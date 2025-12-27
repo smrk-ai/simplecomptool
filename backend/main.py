@@ -70,6 +70,7 @@ from services.persistence import (
     get_previous_snapshot_map, calculate_text_hash
 )
 from utils.url_utils import canonicalize_url
+from validators import validate_scan_url, validate_competitor_name
 
 app = FastAPI(title="Simple CompTool Backend", version="1.0.0")
 
@@ -261,20 +262,25 @@ async def scan_endpoint(request: ScanRequest):
     """
     Vollständiger Website-Scan mit Crawling und Persistenz
     Optional: LLM-basierte Profil-Erstellung
-    
+
     Härtungsmaßnahmen:
     - Max 20 Seiten
     - Max 60 Sekunden Gesamtzeit
     - Max 5 parallele Fetches
     - Strukturierte Fehlerbehandlung
+    - SSRF Protection (Input Validation)
     """
+    # SECURITY: Validate input to prevent SSRF attacks
+    request.url = validate_scan_url(request.url)
+    request.name = validate_competitor_name(request.name)
+
     # Scan-ID generieren für Logging
     scan_id = str(uuid.uuid4())
     start_time = time.time()
-    
+
     # Playwright-Usage-Counter zurücksetzen
     reset_playwright_usage_count()
-    
+
     logger.info(f"[{scan_id}] Scan gestartet für URL: {request.url}")
 
     async def execute_scan():

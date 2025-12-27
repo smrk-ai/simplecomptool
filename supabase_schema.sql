@@ -71,13 +71,20 @@ ALTER TABLE socials ENABLE ROW LEVEL SECURITY;
 ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
 
 -- Policies für anon Zugriff (lesen/schreiben)
-CREATE POLICY "Allow all operations for anon" ON competitors FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY "Allow all operations for anon" ON snapshots FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY "Allow all operations for anon" ON pages FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY "Allow all operations for anon" ON socials FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY "Allow all operations for anon" ON profiles FOR ALL USING (true) WITH CHECK (true);
+-- FIXED: Unique policy names to avoid conflicts
+DROP POLICY IF EXISTS "Allow all operations for anon" ON competitors;
+DROP POLICY IF EXISTS "Allow all operations for anon" ON snapshots;
+DROP POLICY IF EXISTS "Allow all operations for anon" ON pages;
+DROP POLICY IF EXISTS "Allow all operations for anon" ON socials;
+DROP POLICY IF EXISTS "Allow all operations for anon" ON profiles;
 
--- Storage Buckets erstellen (werden automatisch über Python-API erstellt, aber zur Dokumentation hier)
--- Diese werden über die Supabase Dashboard oder API erstellt:
--- Bucket: html-files (private)
--- Bucket: txt-files (private)
+CREATE POLICY "Allow all for anon on competitors" ON competitors FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all for anon on snapshots" ON snapshots FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all for anon on pages" ON pages FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all for anon on socials" ON socials FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all for anon on profiles" ON profiles FOR ALL USING (true) WITH CHECK (true);
+
+-- Storage Buckets erstellen
+-- FIXED: Use single 'snapshots' bucket for both HTML and TXT files
+-- Create via Supabase Dashboard or run: init_db() in backend
+-- Bucket: snapshots (private)

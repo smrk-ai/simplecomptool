@@ -633,12 +633,22 @@ async def download_raw(page_id: str):
         if os.path.exists(local_path):
             with open(local_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            return Response(content=content, media_type="text/html; charset=utf-8")
+            filename = f"page_{page_id}.html"
+            return Response(
+                content=content,
+                media_type="text/html; charset=utf-8",
+                headers={"Content-Disposition": f"attachment; filename={filename}"}
+            )
 
         # Ansonsten aus Supabase Storage laden
         try:
             file_data = supabase.storage.from_("snapshots").download(raw_path)
-            return Response(content=file_data, media_type="text/html; charset=utf-8")
+            filename = f"page_{page_id}.html"
+            return Response(
+                content=file_data,
+                media_type="text/html; charset=utf-8",
+                headers={"Content-Disposition": f"attachment; filename={filename}"}
+            )
         except Exception as storage_error:
             logger.error(f"Supabase Storage download failed: {storage_error}")
             raise HTTPException(status_code=404, detail="File not found in storage")
@@ -674,12 +684,22 @@ async def download_text(page_id: str):
         if os.path.exists(local_path):
             with open(local_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            return Response(content=content, media_type="text/plain; charset=utf-8")
+            filename = f"page_{page_id}.txt"
+            return Response(
+                content=content,
+                media_type="text/plain; charset=utf-8",
+                headers={"Content-Disposition": f"attachment; filename={filename}"}
+            )
 
         # Ansonsten aus Supabase Storage laden
         try:
             file_data = supabase.storage.from_("snapshots").download(text_path)
-            return Response(content=file_data, media_type="text/plain; charset=utf-8")
+            filename = f"page_{page_id}.txt"
+            return Response(
+                content=file_data,
+                media_type="text/plain; charset=utf-8",
+                headers={"Content-Disposition": f"attachment; filename={filename}"}
+            )
         except Exception as storage_error:
             logger.error(f"Supabase Storage download failed: {storage_error}")
             raise HTTPException(status_code=404, detail="File not found in storage")

@@ -10,7 +10,7 @@ import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from services.browser_manager import browser_manager
-from services.persistence import extract_text_from_html
+from services.persistence import extract_text_from_html, extract_text_from_html_v2
 
 # Logging konfigurieren
 logging.basicConfig(level=logging.INFO)
@@ -218,74 +218,6 @@ def requires_javascript(html: str) -> bool:
         return False
 
 
-async def fetch_with_httpx(url: str) -> Dict:
-    """
-    Fetcht eine URL mit httpx (async mit retries)
-    Konfigurierte Timeouts: connect 5s, read 15s
-    """
-    for attempt in range(MAX_RETRIES):
-        try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(CONNECT_TIMEOUT, read=READ_TIMEOUT),
-                follow_redirects=True,
-                headers={"User-Agent": USER_AGENT}
-            ) as client:
-                response = await client.get(url)
-
-                return {
-                    'final_url': str(response.url),
-                    'status': response.status_code,
-                    'headers': dict(response.headers),
-                    'html': response.text,
-                    'fetched_at': datetime.now().isoformat(),
-                    'via': 'httpx'
-                }
-
-        except Exception as e:
-            if attempt == MAX_RETRIES - 1:
-                logger.error(f"httpx fetch fehlgeschlagen für {url}: {e}")
-                raise
-            await asyncio.sleep(1 * (attempt + 1))  # Exponential backoff
-
-
-async def fetch_with_playwright(url: str) -> Dict:
-    """
-    Fetcht eine URL mit Playwright (für JS-required Seiten)
-    Optimiert: Browser-Pool wiederverwenden, schnelleres Wait-Strategy
-    """
-    global _playwright_usage_count
-    _playwright_usage_count += 1
-
-    async with browser_manager.get_browser() as browser:
-        context = await browser.new_context(
-            user_agent=USER_AGENT
-        )
-        page = await context.new_page()
-        try:
-            # Schnelleres Wait-Strategy: domcontentloaded statt networkidle
-            # Timeout basierend auf READ_TIMEOUT
-            await page.goto(url, wait_until="domcontentloaded", timeout=int(READ_TIMEOUT * 1000))
-            await page.wait_for_timeout(500)  # Reduziert von 2000ms auf 500ms
-
-            content = await page.content()
-
-            return {
-                'final_url': page.url,
-                'status': 200,  # Playwright gibt keinen HTTP-Status zurück
-                'headers': {},  # Playwright gibt keine Headers zurück
-                'html': content,
-                'fetched_at': datetime.now().isoformat(),
-                'via': 'playwright'
-            }
-
-        except Exception as e:
-            logger.error(f"Playwright fetch fehlgeschlagen für {url}: {e}")
-            raise
-        finally:
-            await page.close()
-            await context.close()
-
-
 def get_playwright_usage_count() -> int:
     """Gibt die Anzahl der Playwright-Aufrufe zurück (für Logging)"""
     return _playwright_usage_count
@@ -452,19 +384,20 @@ async def fetch_with_playwright(url: str, timeout: int = 30000) -> str:
     Browser fetch für JS-heavy Sites.
     Timeout: 30 Sekunden
     """
-    browser = await browser_manager.get_browser()
-    context = await browser.new_context(
-        user_agent='Mozilla/5.0 (compatible; SimpleCompTool/1.0)'
-    )
-    page = await context.new_page()
+    # ✅ Context Manager richtig nutzen
+    async with browser_manager.get_browser() as browser:
+        context = await browser.new_context(
+            user_agent='Mozilla/5.0 (compatible; SimpleCompTool/1.0)'
+        )
+        page = await context.new_page()
 
-    try:
-        await page.goto(url, wait_until='networkidle', timeout=timeout)
-        html = await page.content()
-        return html
-    finally:
-        await page.close()
-        await context.close()
+        try:
+            await page.goto(url, wait_until='networkidle', timeout=timeout)
+            html = await page.content()
+            return html
+        finally:
+            await page.close()
+            await context.close()
 
 
 async def fetch_page_smart(
@@ -498,7 +431,10 @@ async def fetch_page_smart(
         try:
             # Try httpx first (fast)
             html_httpx = await fetch_with_httpx(url)
-            text_httpx = extract_text_from_html(html_httpx)
+
+            # Extract text for content check (use v2)
+            extraction_result_httpx = extract_text_from_html_v2(html_httpx)
+            text_httpx = extraction_result_httpx['text']
 
             # Content Check
             if len(text_httpx.strip()) >= min_content_chars:
@@ -519,7 +455,8 @@ async def fetch_page_smart(
 
     # Final metrics
     duration = time.time() - start_time
-    text_final = extract_text_from_html(html)
+    extraction_result_final = extract_text_from_html_v2(html)
+    text_final = extraction_result_final['text']
     content_length = len(text_final)
 
     logger.info(f"✅ {url} via {via} in {duration:.2f}s → {content_length} chars")

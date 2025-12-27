@@ -59,3 +59,4 @@ class BrowserManager:
 
 # Global Instance
 browser_manager = BrowserManager()
+

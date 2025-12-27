@@ -306,29 +306,42 @@ def save_page(snapshot_id: str, fetch_result: Dict, competitor_id: str) -> Dict:
 
     page_id = str(uuid.uuid4())
 
-    # Text-Extraktion
-    title, meta_description, normalized_text = extract_text_from_html(fetch_result['html'])
+    # Text-Extraktion mit v2
+    extraction_result = extract_text_from_html_v2(fetch_result['html'])
+    normalized_text = extraction_result['text']
     sha256_text = calculate_text_hash(normalized_text)
 
-    # Supabase Storage Pfade
+    # Extract title and meta_description from HTML
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(fetch_result['html'], 'html.parser')
+        title = soup.title.string.strip() if soup.title and soup.title.string else ""
+        meta_desc_tag = soup.find('meta', attrs={'name': 'description'})
+        meta_description = meta_desc_tag.get('content', '').strip() if meta_desc_tag else ""
+    except Exception as e:
+        logger.warning(f"Fehler bei Title/Meta-Extraktion: {e}")
+        title = ""
+        meta_description = ""
+
+    # Supabase Storage Pfade (im snapshots bucket)
     html_path = f"{snapshot_id}/pages/{page_id}.html"
     txt_path = f"{snapshot_id}/pages/{page_id}.txt"
 
     try:
-        # HTML-Datei zu Supabase Storage hochladen
+        # HTML-Datei zu Supabase Storage hochladen (snapshots bucket)
         html_bytes = fetch_result['html'].encode('utf-8')
-        supabase.storage.from_('html-files').upload(
+        supabase.storage.from_('snapshots').upload(
             path=html_path,
             file=html_bytes,
-            file_options={"content-type": "text/html"}
+            file_options={"content-type": "text/html; charset=utf-8"}
         )
 
-        # TXT-Datei zu Supabase Storage hochladen
+        # TXT-Datei zu Supabase Storage hochladen (snapshots bucket)
         txt_bytes = normalized_text.encode('utf-8')
-        supabase.storage.from_('txt-files').upload(
+        supabase.storage.from_('snapshots').upload(
             path=txt_path,
             file=txt_bytes,
-            file_options={"content-type": "text/plain"}
+            file_options={"content-type": "text/plain; charset=utf-8"}
         )
 
     except Exception as e:
@@ -352,7 +365,16 @@ def save_page(snapshot_id: str, fetch_result: Dict, competitor_id: str) -> Dict:
         'text_path': txt_path,
         'sha256_text': sha256_text,
         'title': title,
-        'meta_description': meta_description
+        'meta_description': meta_description,
+        # NEUE FELDER FÜR CHANGE DETECTION
+        'canonical_url': fetch_result.get('canonical_url'),
+        'changed': fetch_result.get('changed', True),
+        'prev_page_id': fetch_result.get('prev_page_id'),
+        'text_length': fetch_result.get('text_length'),
+        'normalized_len': fetch_result.get('normalized_len'),
+        'has_truncation': fetch_result.get('has_truncation', False),
+        'extraction_version': fetch_result.get('extraction_version', 'v1'),
+        'fetch_duration': fetch_result.get('fetch_duration')
     }
 
     try:
@@ -371,7 +393,15 @@ def save_page(snapshot_id: str, fetch_result: Dict, competitor_id: str) -> Dict:
             'sha256_text': sha256_text,
             'title': title,
             'meta_description': meta_description,
-            'text_path': txt_path
+            'text_path': txt_path,
+            # NEUE FELDER FÜR CHANGE DETECTION
+            'canonical_url': fetch_result.get('canonical_url'),
+            'changed': fetch_result.get('changed', True),
+            'prev_page_id': fetch_result.get('prev_page_id'),
+            'text_length': fetch_result.get('text_length'),
+            'has_truncation': fetch_result.get('has_truncation', False),
+            'extraction_version': fetch_result.get('extraction_version', 'v1'),
+            'fetch_duration': fetch_result.get('fetch_duration')
         }
 
     except Exception as e:
@@ -601,3 +631,115 @@ def get_competitor_profile(competitor_id: str, snapshot_id: Optional[str] = None
     except Exception as e:
         logger.error(f"Fehler beim Laden des Profils: {e}")
         return None
+
+
+def canonicalize_url(url: str) -> str:
+    """
+    Normalisiert URL für Vergleich:
+    - https (immer)
+    - ohne www
+    - ohne Fragment (#)
+    - ohne Tracking-Params (utm_*, fbclid, gclid, etc.)
+    - lowercase domain
+    - path ohne trailing slash (außer root /)
+
+    Beispiel:
+    https://WWW.example.com/page/?utm_source=google#section
+    → https://example.com/page
+    """
+    from urllib.parse import urlparse, urlunparse
+    import re
+
+    url = url.lower().strip()
+    parsed = urlparse(url)
+
+    # Entferne www
+    netloc = parsed.netloc
+    if netloc.startswith('www.'):
+        netloc = netloc[4:]
+
+    # Entferne Tracking-Params
+    query = parsed.query
+    if query:
+        params = []
+        for param in query.split('&'):
+            if not param:
+                continue
+            key = param.split('=')[0]
+            # Blocke bekannte Tracking-Params
+            tracking_prefixes = ['utm_', 'fbclid', 'gclid', 'mc_', '_ga', 'ref', 'source']
+            if not any(key.startswith(p) for p in tracking_prefixes):
+                params.append(param)
+        query = '&'.join(params)
+
+    # Entferne trailing slash (außer root)
+    path = parsed.path.rstrip('/') if parsed.path != '/' else '/'
+
+    canonical = urlunparse((
+        'https',           # Immer HTTPS
+        netloc,            # Domain ohne www
+        path,              # Path ohne trailing slash
+        '',                # Params (leer)
+        query,             # Query ohne Tracking
+        ''                 # Fragment (leer)
+    ))
+
+    return canonical
+
+
+async def get_previous_snapshot_map(competitor_id: str) -> dict:
+    """
+    Lädt neuesten Snapshot für Competitor und erstellt Hash-Map.
+
+    Returns:
+    {
+        'canonical_url': {
+            'page_id': uuid,
+            'sha256_text': str,
+            'text_length': int
+        },
+        ...
+    }
+
+    Wenn kein Previous Snapshot → {}
+    """
+    logger = logging.getLogger(__name__)
+
+    # Neuesten Snapshot finden
+    snapshot_result = supabase.table("snapshots")\
+        .select("id")\
+        .eq("competitor_id", competitor_id)\
+        .order("created_at", desc=True)\
+        .limit(1)\
+        .execute()
+
+    if not snapshot_result.data:
+        logger.info(f"No previous snapshot for competitor {competitor_id}")
+        return {}
+
+    prev_snapshot_id = snapshot_result.data[0]['id']
+    logger.info(f"Found previous snapshot: {prev_snapshot_id}")
+
+    # Alle Pages des Previous Snapshots laden
+    pages_result = supabase.table("pages")\
+        .select("id, canonical_url, sha256_text, text_length")\
+        .eq("snapshot_id", prev_snapshot_id)\
+        .execute()
+
+    if not pages_result.data:
+        logger.warning(f"Previous snapshot {prev_snapshot_id} has no pages")
+        return {}
+
+    # Map erstellen: canonical_url → page_data
+    page_map = {}
+    for page in pages_result.data:
+        canonical = page.get('canonical_url')
+        if canonical:  # Skip NULL canonical_urls
+            page_map[canonical] = {
+                'page_id': page['id'],
+                'sha256_text': page.get('sha256_text', ''),
+                'text_length': page.get('text_length', 0)
+            }
+
+    logger.info(f"Loaded {len(page_map)} pages from previous snapshot")
+    return page_map

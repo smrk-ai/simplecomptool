@@ -27,7 +27,8 @@ from services.crawler import (
 from services.persistence import (
     init_db, get_or_create_competitor, create_snapshot, save_page,
     update_snapshot_page_count, get_snapshot_pages, get_competitor_socials,
-    create_profile_with_llm
+    create_profile_with_llm, extract_text_from_html_v2, canonicalize_url,
+    get_previous_snapshot_map, calculate_text_hash
 )
 
 app = FastAPI(title="Simple CompTool Backend", version="1.0.0")
@@ -263,7 +264,11 @@ async def scan_endpoint(request: ScanRequest):
             snapshot_id = create_snapshot(competitor_id)
             logger.info(f"[{scan_id}] Snapshot erstellt: {snapshot_id}")
 
-            # 4. Semaphore für Concurrency-Control
+            # 4. Previous Snapshot für Hash-Comparison laden
+            prev_map = await get_previous_snapshot_map(competitor_id)
+            logger.info(f"[{scan_id}] Previous snapshot has {len(prev_map)} pages")
+
+            # 5. Semaphore für Concurrency-Control
             semaphore = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
             fetch_success_count = 0
             fetch_error_count = 0
@@ -271,15 +276,62 @@ async def scan_endpoint(request: ScanRequest):
             async def fetch_and_save_page(url: str):
                 """Fetcht eine URL und speichert sie (mit Semaphore)"""
                 nonlocal fetch_success_count, fetch_error_count
+                logger.info(f"[{scan_id}] Processing URL: {url} (type: {type(url).__name__})")
                 async with semaphore:  # Concurrency-Control
                     try:
+                        # ✅ Ensure URL is string
+                        url_str = url if isinstance(url, str) else str(url)
                         # ✅ Nutze Smart Fetch
                         fetch_result = await fetch_page_smart(
-                            url,
+                            url_str,
                             force_playwright=request.use_playwright
                         )
 
-                        # Konvertiere zu altem fetch_url Format für save_page Kompatibilität
+                        html = fetch_result['html']
+                        via = fetch_result['via']
+                        duration = fetch_result['duration']
+
+                        # ✅ Extract mit V2 (vollständiger Content, kein 50k Limit!)
+                        extraction_result = extract_text_from_html_v2(html)
+                        text = extraction_result['text']
+                        text_length = extraction_result['text_length']
+                        extraction_version = extraction_result['extraction_version']
+                        has_truncation = extraction_result['has_truncation']
+
+                        sha256_new = calculate_text_hash(text)
+                        canonical = canonicalize_url(url)
+
+                        # ✅ Hash-Vergleich mit Previous Snapshot
+                        changed = True
+                        prev_page_id = None
+
+                        if canonical in prev_map:
+                            prev_page = prev_map[canonical]
+                            sha256_old = prev_page['sha256_text']
+
+                            if sha256_new == sha256_old:
+                                # UNCHANGED!
+                                changed = False
+                                prev_page_id = prev_page['page_id']
+                                logger.info(f"[{scan_id}] ✓ UNCHANGED: {canonical}")
+                            else:
+                                # CHANGED!
+                                prev_page_id = prev_page['page_id']
+                                logger.info(f"[{scan_id}] ✗ CHANGED: {canonical}")
+                        else:
+                            # NEW PAGE!
+                            logger.info(f"[{scan_id}] ➕ NEW: {canonical}")
+
+                        # Extract title & meta (bleibt gleich wie vorher)
+                        from bs4 import BeautifulSoup
+                        soup = BeautifulSoup(html, 'html.parser')
+                        title = soup.find('title')
+                        title_text = title.get_text(strip=True) if title else None
+
+                        meta_desc = soup.find('meta', attrs={'name': 'description'})
+                        meta_description = meta_desc.get('content', '').strip() if meta_desc else None
+
+                        # Konvertiere zu altem fetch_url Format für save_page Kompatibilität (mit neuen Feldern)
                         fetch_result_compat = {
                             'final_url': fetch_result['url'],
                             'status': 200,  # Smart fetch gibt keinen Status zurück
@@ -287,7 +339,16 @@ async def scan_endpoint(request: ScanRequest):
                             'html': fetch_result['html'],
                             'fetched_at': datetime.now().isoformat(),
                             'via': fetch_result['via'],
-                            'original_url': url
+                            'original_url': url,
+                            # NEUE FELDER FÜR CHANGE DETECTION
+                            'canonical_url': canonical,
+                            'changed': changed,
+                            'prev_page_id': prev_page_id,
+                            'text_length': text_length,
+                            'normalized_len': len(text),
+                            'has_truncation': has_truncation,
+                            'extraction_version': extraction_version,
+                            'fetch_duration': duration
                         }
 
                         # Page speichern (inkl. Dateien und Social Links)
@@ -411,7 +472,7 @@ def get_snapshot_endpoint(snapshot_id: str):
 
 @app.get("/api/pages/{page_id}/raw")
 async def download_raw(page_id: str):
-    """Download raw HTML"""
+    """Download raw HTML - mit lokalem Fallback"""
     try:
         supabase = _ensure_supabase()
 
@@ -420,25 +481,39 @@ async def download_raw(page_id: str):
             .eq("id", page_id)\
             .single()\
             .execute()
-        
+
         if not page_result.data:
             raise HTTPException(status_code=404, detail="Page not found")
-        
+
         raw_path = page_result.data.get('raw_path')
-        
+
         if not raw_path:
             raise HTTPException(status_code=404, detail="Raw HTML not available")
-        
-        file_data = supabase.storage.from_("snapshots").download(raw_path)
-        return Response(content=file_data, media_type="text/html; charset=utf-8")
-        
+
+        # Erst lokales Filesystem versuchen (Fallback für alte Daten)
+        local_path = os.path.join("backend/data/snapshots", raw_path)
+        if os.path.exists(local_path):
+            with open(local_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            return Response(content=content, media_type="text/html; charset=utf-8")
+
+        # Ansonsten aus Supabase Storage laden
+        try:
+            file_data = supabase.storage.from_("snapshots").download(raw_path)
+            return Response(content=file_data, media_type="text/html; charset=utf-8")
+        except Exception as storage_error:
+            logger.error(f"Supabase Storage download failed: {storage_error}")
+            raise HTTPException(status_code=404, detail="File not found in storage")
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Download raw failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/pages/{page_id}/text")
 async def download_text(page_id: str):
-    """Download extracted text"""
+    """Download extracted text - mit lokalem Fallback"""
     try:
         supabase = _ensure_supabase()
 
@@ -447,18 +522,32 @@ async def download_text(page_id: str):
             .eq("id", page_id)\
             .single()\
             .execute()
-        
+
         if not page_result.data:
             raise HTTPException(status_code=404, detail="Page not found")
-        
+
         text_path = page_result.data.get('text_path')
-        
+
         if not text_path:
             raise HTTPException(status_code=404, detail="Text not available")
-        
-        file_data = supabase.storage.from_("snapshots").download(text_path)
-        return Response(content=file_data, media_type="text/plain; charset=utf-8")
-        
+
+        # Erst lokales Filesystem versuchen (Fallback für alte Daten)
+        local_path = os.path.join("backend/data/snapshots", text_path)
+        if os.path.exists(local_path):
+            with open(local_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            return Response(content=content, media_type="text/plain; charset=utf-8")
+
+        # Ansonsten aus Supabase Storage laden
+        try:
+            file_data = supabase.storage.from_("snapshots").download(text_path)
+            return Response(content=file_data, media_type="text/plain; charset=utf-8")
+        except Exception as storage_error:
+            logger.error(f"Supabase Storage download failed: {storage_error}")
+            raise HTTPException(status_code=404, detail="File not found in storage")
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Download text failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

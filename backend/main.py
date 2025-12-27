@@ -260,13 +260,13 @@ async def scan_endpoint(request: ScanRequest):
                 urls_to_fetch = urls_to_fetch[:MAX_URLS]
                 logger.warning(f"[{scan_id}] URLs auf {MAX_URLS} begrenzt")
 
-            # 3. Snapshot erstellen
-            snapshot_id = create_snapshot(competitor_id)
-            logger.info(f"[{scan_id}] Snapshot erstellt: {snapshot_id}")
-
-            # 4. Previous Snapshot für Hash-Comparison laden
+            # 3. Previous Snapshot für Hash-Comparison laden (VOR create_snapshot!)
             prev_map = await get_previous_snapshot_map(competitor_id)
             logger.info(f"[{scan_id}] Previous snapshot has {len(prev_map)} pages")
+
+            # 4. Snapshot erstellen (NACH dem Laden des previous snapshots)
+            snapshot_id = create_snapshot(competitor_id)
+            logger.info(f"[{scan_id}] Snapshot erstellt: {snapshot_id}")
 
             # 5. Semaphore für Concurrency-Control
             semaphore = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
@@ -464,11 +464,90 @@ def get_competitor_endpoint(competitor_id: str):
     return competitor
 
 @app.get("/api/snapshots/{snapshot_id}")
-def get_snapshot_endpoint(snapshot_id: str):
-    snapshot = get_snapshot(snapshot_id)
-    if not snapshot:
-        raise HTTPException(status_code=404, detail="Snapshot nicht gefunden")
-    return snapshot
+async def get_snapshot_details(snapshot_id: str):
+    """
+    Liefert vollständige Snapshot-Details für Results Page.
+
+    Response:
+    - Snapshot Metadata
+    - Competitor Info
+    - All Pages (mit changed/unchanged Flag)
+    - Profil (falls vorhanden)
+    - Social Links
+    - Stats (changed/unchanged counts)
+    """
+    try:
+        supabase = _ensure_supabase()
+        # Snapshot + Competitor laden
+        snapshot_result = supabase.table("snapshots")\
+            .select("*, competitors(*)")\
+            .eq("id", snapshot_id)\
+            .single()\
+            .execute()
+
+        if not snapshot_result.data:
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+
+        snapshot = snapshot_result.data
+        competitor = snapshot.get('competitors')
+
+        if not competitor:
+            raise HTTPException(status_code=404, detail="Competitor not found")
+
+        # Pages laden (alle, sortiert nach URL)
+        pages_result = supabase.table("pages")\
+            .select("id, url, canonical_url, changed, status, title, via, text_length, extraction_version")\
+            .eq("snapshot_id", snapshot_id)\
+            .order("canonical_url")\
+            .execute()
+
+        pages = pages_result.data or []
+
+        # Stats berechnen
+        changed_count = sum(1 for p in pages if p.get('changed', True))
+        unchanged_count = len(pages) - changed_count
+
+        # Profil laden (falls vorhanden)
+        profile_result = supabase.table("profiles")\
+            .select("text")\
+            .eq("snapshot_id", snapshot_id)\
+            .execute()
+
+        # Profil ist optional - kann leer sein
+        if profile_result.data and len(profile_result.data) > 0:
+            profile_text = profile_result.data[0].get('text')
+        else:
+            profile_text = None
+
+        # Social Links laden
+        socials_result = supabase.table("socials")\
+            .select("platform, url, handle")\
+            .eq("competitor_id", competitor['id'])\
+            .execute()
+
+        # Response zusammenstellen
+        return {
+            "id": snapshot_id,
+            "competitor_id": competitor['id'],
+            "competitor_name": competitor.get('name') or competitor['base_url'],
+            "competitor_url": competitor['base_url'],
+            "created_at": snapshot['created_at'],
+            "status": snapshot.get('status', 'done'),
+            "pages": pages,
+            "profile": profile_text,
+            "socials": socials_result.data or [],
+            "stats": {
+                "total_pages": len(pages),
+                "changed_pages": changed_count,
+                "unchanged_pages": unchanged_count
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error loading snapshot {snapshot_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/pages/{page_id}/raw")
 async def download_raw(page_id: str):

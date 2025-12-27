@@ -63,11 +63,11 @@ def init_db():
     """Initialisiert die Supabase-Verbindung"""
     global supabase
 
-    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        raise ValueError("SUPABASE_URL und SUPABASE_ANON_KEY müssen gesetzt sein")
+    if not SUPABASE_URL or not SERVICE_ROLE_KEY:
+        raise ValueError("SUPABASE_URL und SERVICE_ROLE_KEY müssen gesetzt sein")
 
-    # Supabase Client mit Anon Key für normale Operationen
-    supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    # Supabase Client mit Service Role Key für volle Berechtigungen (bypass RLS)
+    supabase = create_client(SUPABASE_URL, SERVICE_ROLE_KEY)
 
     logger.info("Supabase-Verbindung initialisiert")
 

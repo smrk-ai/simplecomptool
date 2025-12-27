@@ -245,15 +245,38 @@ async def fetch_url(url: str) -> Dict:
         }
     """
     try:
-        # Zuerst mit httpx versuchen
-        result = await fetch_with_httpx(url)
+        # httpx fetch
+        async with httpx.AsyncClient(
+            timeout=15,
+            follow_redirects=True,
+            headers={'User-Agent': 'Mozilla/5.0 (compatible; SimpleCompTool/1.0)'}
+        ) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            html = response.text
 
-        # Nur bei wirklich JS-required Seiten Playwright verwenden
-        if requires_javascript(result['html']):
-            logger.info(f"JS erforderlich für {url}, verwende Playwright")
-            result = await fetch_with_playwright(url)
+            # Nur bei wirklich JS-required Seiten Playwright verwenden
+            if requires_javascript(html):
+                logger.info(f"JS erforderlich für {url}, verwende Playwright")
+                playwright_result = await fetch_with_playwright(url)
+                return {
+                    'final_url': url,
+                    'status': 200,
+                    'headers': {},
+                    'html': playwright_result,
+                    'fetched_at': datetime.now().isoformat(),
+                    'via': 'playwright'
+                }
 
-        return result
+            # ✅ IMMER Dict zurückgeben
+            return {
+                'final_url': str(response.url),
+                'status': response.status_code,
+                'headers': dict(response.headers),
+                'html': html,
+                'fetched_at': datetime.now().isoformat(),
+                'via': 'httpx'
+            }
 
     except Exception as e:
         # KEIN Playwright-Fallback mehr - einfach Fehler zurückgeben

@@ -223,24 +223,34 @@ def get_competitors() -> List[dict]:
 def get_competitor(competitor_id: str) -> Optional[dict]:
     try:
         supabase = _ensure_supabase()
-        # Competitor laden
-        competitor_result = supabase.table('competitors').select(
-            'id, name, base_url, created_at'
-        ).eq('id', competitor_id).execute()
+
+        # PERFORMANCE FIX: 1 Query statt 3 (JOIN)
+        # Lädt Competitor mit allen Snapshots und Socials in EINER Query
+        competitor_result = supabase.table('competitors').select('''
+            id, name, base_url, created_at,
+            snapshots(id, created_at, page_count, notes),
+            socials(platform, handle, url, discovered_at, source_url)
+        ''').eq('id', competitor_id).single().execute()
 
         if not competitor_result.data:
             return None
 
-        competitor = competitor_result.data[0]
-        competitor["snapshots"] = []
-        competitor["socials"] = get_competitor_socials(competitor_id)
+        competitor = competitor_result.data
 
-        # Snapshots für diesen Competitor laden
-        snapshots_result = supabase.table('snapshots').select(
-            'id, created_at, page_count, notes'
-        ).eq('competitor_id', competitor_id).order('created_at', desc=True).execute()
+        # Snapshots nach created_at sortieren (DESC)
+        if competitor.get("snapshots"):
+            competitor["snapshots"] = sorted(
+                competitor["snapshots"],
+                key=lambda x: x.get("created_at", ""),
+                reverse=True
+            )
+        else:
+            competitor["snapshots"] = []
 
-        competitor["snapshots"] = snapshots_result.data
+        # Socials sicherstellen
+        if not competitor.get("socials"):
+            competitor["socials"] = []
+
         return competitor
     except Exception as e:
         logger.error(f"Fehler beim Laden des Competitors: {e}")

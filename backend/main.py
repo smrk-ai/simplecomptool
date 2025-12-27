@@ -11,6 +11,10 @@ import time
 import logging
 from dotenv import load_dotenv
 
+# Logger konfigurieren (VOR allen anderen Initialisierungen)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Environment Variables laden
 import pathlib
 env_path = pathlib.Path(__file__).parent.parent / ".env.local"
@@ -250,9 +254,6 @@ def get_snapshot(snapshot_id: str) -> Optional[dict]:
     except Exception as e:
         logger.error(f"Fehler beim Laden des Snapshots: {e}")
         return None
-
-# Logger konfigurieren
-logger = logging.getLogger(__name__)
 
 # API Endpoints
 @app.post("/api/scan", response_model=ScanResponse)

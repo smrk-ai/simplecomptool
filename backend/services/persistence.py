@@ -665,9 +665,14 @@ def get_competitor_profile(competitor_id: str, snapshot_id: Optional[str] = None
 from utils.url_utils import canonicalize_url
 
 
-async def get_previous_snapshot_map(competitor_id: str) -> dict:
+async def get_previous_snapshot_map(competitor_id: str, exclude_snapshot_id: Optional[str] = None) -> dict:
     """
     Lädt neuesten Snapshot für Competitor und erstellt Hash-Map.
+
+    Args:
+        competitor_id: ID des Competitors
+        exclude_snapshot_id: Optional - Snapshot ID die NICHT geladen werden soll
+                             (verhindert Race Condition bei parallelen Scans)
 
     Returns:
     {
@@ -683,13 +688,17 @@ async def get_previous_snapshot_map(competitor_id: str) -> dict:
     """
     logger = logging.getLogger(__name__)
 
-    # Neuesten Snapshot finden
-    snapshot_result = supabase.table("snapshots")\
+    # Neuesten Snapshot finden (exclude current snapshot if provided)
+    query = supabase.table("snapshots")\
         .select("id")\
         .eq("competitor_id", competitor_id)\
-        .order("created_at", desc=True)\
-        .limit(1)\
-        .execute()
+        .order("created_at", desc=True)
+
+    # Exclude current snapshot (prevents race condition)
+    if exclude_snapshot_id:
+        query = query.neq("id", exclude_snapshot_id)
+
+    snapshot_result = query.limit(1).execute()
 
     if not snapshot_result.data:
         logger.info(f"No previous snapshot for competitor {competitor_id}")

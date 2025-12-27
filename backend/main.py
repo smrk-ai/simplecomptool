@@ -343,13 +343,14 @@ async def scan_endpoint(http_request: Request, request: ScanRequest):
                 urls_to_fetch = urls_to_fetch[:MAX_URLS]
                 logger.warning(f"[{scan_id}] URLs auf {MAX_URLS} begrenzt")
 
-            # 3. Previous Snapshot für Hash-Comparison laden (VOR create_snapshot!)
-            prev_map = await get_previous_snapshot_map(competitor_id)
-            logger.info(f"[{scan_id}] Previous snapshot has {len(prev_map)} pages")
-
-            # 4. Snapshot erstellen (NACH dem Laden des previous snapshots)
+            # 3. Snapshot erstellen (ERST erstellen, dann previous laden mit exclude)
             snapshot_id = create_snapshot(competitor_id)
             logger.info(f"[{scan_id}] Snapshot erstellt: {snapshot_id}")
+
+            # 4. Previous Snapshot für Hash-Comparison laden (MIT exclude_snapshot_id)
+            # WICHTIG: exclude_snapshot_id verhindert Race Condition bei parallelen Scans
+            prev_map = await get_previous_snapshot_map(competitor_id, exclude_snapshot_id=snapshot_id)
+            logger.info(f"[{scan_id}] Previous snapshot has {len(prev_map)} pages")
 
             # 5. Semaphore für Concurrency-Control
             semaphore = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)

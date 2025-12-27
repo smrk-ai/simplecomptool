@@ -70,3 +70,4 @@ class BrowserManager:
 browser_manager = BrowserManager()
 
 
+

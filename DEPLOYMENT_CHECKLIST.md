@@ -207,3 +207,4 @@ NEXT_PUBLIC_API_URL=https://your-backend.up.railway.app
 2. Teste Health Check
 3. Prüfe Supabase Connection (Logs)
 ````
+
